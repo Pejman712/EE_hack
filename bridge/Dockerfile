@@ -35,11 +35,13 @@ RUN pip3 install --no-cache-dir --upgrade pip \
 # package with find_spec (NOT `import unitree_sdk2py`) — importing it fails with a
 # circular-import error precisely because b2/__init__.py doesn't exist yet.
 
-COPY pointcloud2.py app.py cyclonedds.xml ./
+COPY pointcloud2.py posestamped.py app.py cyclonedds.xml ./
 
 ENV FOXGLOVE_PORT=8765
 ENV INGEST_PORT=8766
 ENV LIDAR_TOPIC=rt/utlidar/cloud_deskewed
+ENV MAP_TOPIC=rt/uslam/cloud_map
+ENV SLAM_POSE_TOPIC=rt/utlidar/robot_pose
 # Pin the DDS NIC by address (the Go2 Orin is multi-homed).
 ENV CYCLONEDDS_URI=file:///app/cyclonedds.xml
 EXPOSE 8765
