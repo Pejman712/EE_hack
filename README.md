@@ -2,22 +2,51 @@
 
 Stream a **Unitree Go2**'s live data into **Foxglove** over a single WebSocket —
 LiDAR point cloud, pose + TF, body state (IMU / battery / foot forces) and UWB,
-plus the front camera. A lighter cousin of `go2-watchtower` (no vision/mic/audio).
+plus the front camera — and drive it with the Unitree Python SDK's Sport API.
 
 ```
 Go2 controller ──DDS──┐
   192.168.123.161      │   ┌──────────────────────────────┐
                        ├──▶│ bridge  (DDS → Foxglove WS)    │──▶ ws://<device>:8765 ──▶ Foxglove
-  Jetson .123.18  ─────┘   │   /go2/points /go2/pose /tf    │
-                           │   /go2/state /go2/uwb          │
+  Jetson .123.18  ─────┤   │   /go2/points /go2/pose /tf    │
+                       │   │   /go2/state /go2/uwb          │
+                       │   └──────────────────────────────┘
+                       │   ┌──────────────────────────────┐
+                       ├──▶│ control (HTTP → SportClient)   │──▶ rt/api/sport/request
+                       │   │   /standup /move /stop /damp   │
+                       │   └──────────────────────────────┘
         front cam ──WebRTC─▶│ camera ──localhost JPEG──▶ /go2/camera
                            └──────────────────────────────┘
 ```
 
-**Two containers, one connection.** The `camera` service does the heavy WebRTC
-decode in isolation and forwards JPEG frames to the `bridge` over localhost, so the
-camera appears on the *same* Foxglove connection — but if WebRTC fails, the 3D/LiDAR
-view stays up.
+**Independent containers, one robot LAN.** The `camera` service does the heavy
+WebRTC decode in isolation and forwards JPEG frames to the `bridge` over localhost,
+so the camera appears on the *same* Foxglove connection — but if WebRTC fails, the
+3D/LiDAR view stays up. The `control` service is a separate DDS participant that only
+writes (it never subscribes), so driving the robot can't be slowed down by the
+bridge's read load.
+
+## control (drive the robot)
+
+The `control` service wraps `unitree_sdk2py`'s high-level `SportClient` — the same
+SDK the `bridge` already vendors to read `lowstate`/`sportmodestate` — behind a tiny
+HTTP API, so you can drive the robot with `curl` instead of writing DDS code:
+
+```bash
+curl -X POST http://<device>:8767/standup
+curl -X POST http://<device>:8767/move -H 'content-type: application/json' \
+  -d '{"vx": 0.3, "vy": 0, "vyaw": 0, "duration_s": 1.0}'
+curl -X POST http://<device>:8767/stop
+```
+
+`Move()` is a velocity command the robot's watchdog expects repeated, so `/move`
+re-sends it at 10 Hz for `duration_s` and calls `StopMove()` when done. Other
+endpoints: `/standdown`, `/damp`, `/healthz`.
+
+Env (set in `control/Dockerfile`, override at build/run):
+- **CONTROL_PORT** — the HTTP API port (default `8767`).
+- **GO2_DDS_ADDRESS** — *this device's* IP on the robot LAN, set in `control/cyclonedds.xml`
+  (same multi-homed-NIC caveat as `bridge`).
 
 ## Deploy
 
@@ -65,3 +94,7 @@ advertise the wrong subnet.
   the images from an x86 host.
 - **Frames**: the 3D panel's *Display frame* is `base_link`; if the cloud or pose
   looks off, switch the display frame in the panel settings.
+- **control / sport lease**: `SportClient` needs the sport lease (`/api/sport_lease`)
+  — if the Unitree phone app or another SDK client holds it, `/standup` and `/move`
+  will silently no-op or error. Make sure the robot is on a flat, clear area before
+  calling `/move`; nothing in this service stops it from walking into something.
