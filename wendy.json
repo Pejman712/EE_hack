@@ -1,0 +1,26 @@
+{
+    "appId": "foxglove",
+    "version": "0.1.0",
+    "platform": "linux",
+    "services": {
+        "sdk": {
+            "context": "./sdk",
+            "entitlements": [
+                { "type": "network", "mode": "host" }
+            ]
+        },
+        "bridge": {
+            "context": "./bridge",
+            "entitlements": [
+                { "type": "network", "mode": "host" }
+            ]
+        },
+        "camera": {
+            "context": "./camera",
+            "dependsOn": ["bridge"],
+            "entitlements": [
+                { "type": "network", "mode": "host" }
+            ]
+        }
+    }
+}
