@@ -1,2 +1,0 @@
-# Go2 SDK and movement dependencies
-unitree-sdk2-python==0.3.8
