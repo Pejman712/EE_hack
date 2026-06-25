@@ -78,7 +78,9 @@ app = FastAPI(title="go2-nav2-map")
 #               Purely cosmetic: the real TF / AMCL chain is never touched.
 _nav = {"launch": None, "goal": None, "x": None, "y": None, "yaw": None,
         "started": None, "result": None, "pose": None,
-        "odom": None, "odom_zero": None}
+        "odom": None, "odom_zero": None,
+        # liveness stamps for the per-link diagnostics ({"t": <epoch>} or None)
+        "scan": None, "cmdvel": None}
 _map = {"meta": None, "png": None, "png_mtime": None}
 
 
@@ -218,6 +220,32 @@ def _tared_odom():
     return {"x": c * dx + s * dy, "y": -s * dx + c * dy, "yaw": yaw}
 
 
+def _fresh(d, ttl: float = 4.0) -> bool:
+    """True if the liveness/pose dict `d` was stamped within the last `ttl` s."""
+    return bool(d) and (time.time() - d["t"] < ttl)
+
+
+def _liveness_poller(topic: str, key: str, field: str):
+    """Tail `ros2 topic echo <topic> --field <field>` and stamp _nav[key]['t'] on
+    every message — liveness only, no payload parsing. `--field` keeps the bytes
+    printed tiny (e.g. just header.stamp) so this stays cheap even for /scan.
+    Restarts the echo if it dies (topic not up until its publisher is)."""
+    while True:
+        try:
+            proc = subprocess.Popen(
+                ["ros2", "topic", "echo", topic, "--field", field],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                start_new_session=True)
+        except Exception:  # noqa: BLE001
+            time.sleep(3)
+            continue
+        for line in proc.stdout:
+            if line.strip() and line.strip() != "---":
+                _nav[key] = {"t": time.time()}
+        proc.wait()
+        time.sleep(2)  # publisher gone — wait and re-attach
+
+
 # ---------------------------------------------------------------------------- API
 @app.get("/api/map/meta")
 def api_map_meta() -> dict:
@@ -253,6 +281,51 @@ def api_status() -> dict:
         "odom": _tared_odom(),
         "odom_tared": _nav["odom_zero"] is not None,
     }
+
+
+@app.get("/api/nav/diag")
+def api_diag() -> dict:
+    """Per-link health of the nav chain, in dependency order. Each step's `ok` is
+    True/False, or None when the check only applies while navigating. The UI walks
+    these top-to-bottom and stops at the first broken link (the `blocker`)."""
+    navg = _is_navigating()
+    steps = [
+        {"name": "Nav2 stack running",
+         "ok": _launch_alive(),
+         "hint": "server.py auto-launches nav2_mapped.launch.py — if this stays red, "
+                 "read the server log; a node probably crashed on startup.",
+         "cmd": "ros2 node list   # expect map_server, amcl, *_server, bt_navigator"},
+        {"name": "Odometry  (utlidar → odom→base_link)",
+         "ok": _fresh(_nav["odom"]),
+         "hint": "go2_odom isn't getting /utlidar/robot_odom. Check the topic exists "
+                 "and the DDS domain matches; else relaunch with ODOM_SOURCE=sportmodestate.",
+         "cmd": "ros2 topic hz /utlidar/robot_odom ; ros2 run tf2_ros tf2_echo odom base_link"},
+        {"name": "Laser  /scan",
+         "ok": _fresh(_nav["scan"]),
+         "hint": "pointcloud_to_laserscan produced nothing. Usual causes: cloud frame_id "
+                 "≠ utlidar_lidar, clock skew (raise transform_tolerance), or an empty "
+                 "height band in pointcloud_to_laserscan.yaml.",
+         "cmd": "ros2 topic hz /scan ; ros2 topic echo --field header.frame_id /utlidar/cloud_deskewed"},
+        {"name": "Localization  (AMCL map→odom)",
+         "ok": _fresh(_nav["pose"]),
+         "hint": "AMCL isn't publishing map→odom. Set the initial pose so the scan lands "
+                 "on the walls, and confirm amcl reached 'active'.",
+         "cmd": "ros2 lifecycle get /amcl ; ros2 run tf2_ros tf2_echo map base_link"},
+        {"name": "Controller output  /cmd_vel",
+         "ok": _fresh(_nav["cmdvel"]) if navg else None,
+         "hint": "Only meaningful while a goal is active. If navigating but this is red, "
+                 "the planner/controller is stuck: no valid path, costmap blocked, or the "
+                 "goal sits in an obstacle/unknown cell.",
+         "cmd": "ros2 topic echo /cmd_vel"},
+        {"name": "Sport bridge  (/cmd_vel → /api/sport/request)",
+         "ok": _fresh(_nav["cmdvel"]) if navg else None,
+         "hint": "cmd_vel_to_sport relays Twist to the dog. If cmd_vel flows but the dog "
+                 "doesn't move: make sure it's in BalanceStand (sport ignores Move while "
+                 "sitting) and watch /api/sport/request.",
+         "cmd": "ros2 topic echo /api/sport/request"},
+    ]
+    blocker = next((i for i, s in enumerate(steps) if s["ok"] is False), None)
+    return {"steps": steps, "blocker": blocker, "navigating": navg}
 
 
 @app.post("/api/nav/odom_reset")
@@ -378,6 +451,18 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   .hint{font-size:12px;color:var(--muted);margin:8px 0 0;}
   .leg{font-size:12px;color:var(--muted);margin-top:8px;}
   .sw{display:inline-block;width:10px;height:10px;border-radius:50%;margin:0 5px 0 12px;vertical-align:middle;}
+  .diag{list-style:none;margin:0;padding:0;counter-reset:step;}
+  .diag li{display:flex;gap:11px;padding:11px 12px;border:1px solid var(--line);
+    border-radius:11px;margin-bottom:8px;background:#0f1217;opacity:.5;}
+  .diag li.ok{opacity:1;} .diag li.bad{opacity:1;border-color:var(--amber);background:#1c1813;}
+  .diag .ic{font-size:16px;font-weight:900;line-height:1.5;width:18px;flex:none;text-align:center;}
+  .diag li.ok .ic{color:var(--green);} .diag li.bad .ic{color:var(--amber);}
+  .diag li.na .ic{color:var(--muted);}
+  .diag .body{flex:1;min-width:0;}
+  .diag .nm{font-weight:800;font-size:14px;}
+  .diag .ht{font-size:12px;color:var(--muted);margin:3px 0 0;}
+  .diag pre{margin:7px 0 0;padding:8px 10px;background:#0a0c10;border:1px solid var(--line);
+    border-radius:8px;font-size:11.5px;color:#cfe9e3;overflow-x:auto;white-space:pre-wrap;}
 </style></head><body><div class="wrap">
   <h1>🗺️ Go2 Map Navigation</h1>
   <p class="sub">Map-based nav2 on the real Go2 (utlidar odometry). Pick a mode, then
@@ -442,6 +527,15 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
         <p class="hint" id="ohint">Live <code>odom→base_link</code> from <code>/utlidar/robot_odom</code>.</p>
       </div>
     </div>
+  </div>
+
+  <div class="card" style="margin-top:18px">
+    <h3 class="amber">✓ Nav chain — step by step</h3>
+    <p class="hint" style="margin:0 0 12px">Each link depends on the one above it.
+      Fix the <b style="color:var(--amber)">highlighted</b> step first, then the rest
+      go green on their own. Greyed steps are waiting on an earlier link (or only
+      apply while navigating).</p>
+    <ol id="diag" class="diag"></ol>
   </div>
 </div>
 <script>
@@ -533,6 +627,24 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     document.getElementById("status").innerHTML=
       "<span class='dot"+(cls?" "+cls:"")+"'></span>"+txt;}
 
+  // Walk the nav chain top-to-bottom: green = up, amber = the first broken link
+  // (shows how to fix it), grey = waiting on an earlier link or nav-only.
+  function renderDiag(d){
+    const ol=document.getElementById("diag");
+    if(!d||!d.steps){return;}
+    ol.innerHTML=d.steps.map((s,i)=>{
+      let cls,ic;
+      if(s.ok===true){cls="ok";ic="✓";}
+      else if(i===d.blocker){cls="bad";ic="✕";}
+      else{cls="na";ic="○";}
+      const detail = cls==="bad"
+        ? "<p class='ht'>"+s.hint+"</p><pre>"+s.cmd+"</pre>"
+        : (s.ok===null ? "<p class='ht'>only checked while navigating</p>" : "");
+      return "<li class='"+cls+"'><div class='ic'>"+ic+"</div>"+
+        "<div class='body'><div class='nm'>"+s.name+"</div>"+detail+"</div></li>";
+    }).join("");
+  }
+
   async function refresh(){
     const s=await j("/api/nav/status");
     robot=s.pose?{x:s.pose.x,y:s.pose.y,yaw:s.pose.yaw}:null;redraw();
@@ -543,6 +655,7 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     document.getElementById("ohint").innerHTML=s.odom_tared
       ?"Tared — showing displacement since reset (display only; TF/AMCL untouched)."
       :"Live <code>odom→base_link</code> from <code>/utlidar/robot_odom</code>.";
+    renderDiag(await j("/api/nav/diag"));
     if(!s.nav2_up){setStatus("warn","nav2 starting up…");return;}
     let m=robot?"":"  (no robot pose yet — set an initial pose)";
     if(s.navigating)setStatus("on","navigating → ("+s.goal.x.toFixed(2)+", "+s.goal.y.toFixed(2)+") m"+m);
@@ -574,6 +687,11 @@ def _bootstrap():
     threading.Thread(target=_tf_poller, args=("map", "base_link", "pose"),
                      daemon=True).start()
     threading.Thread(target=_tf_poller, args=("odom", "base_link", "odom"),
+                     daemon=True).start()
+    # per-link liveness for the diagnostics panel
+    threading.Thread(target=_liveness_poller, args=("/scan", "scan", "header.stamp"),
+                     daemon=True).start()
+    threading.Thread(target=_liveness_poller, args=("/cmd_vel", "cmdvel", "linear.x"),
                      daemon=True).start()
 
 
