@@ -67,9 +67,15 @@ def generate_launch_description():
         DeclareLaunchArgument('use_compressed', default_value='false',
                               description='Pose node reads the COMPRESSED camera stream '
                                           '(higher FPS over a network / real robot)'),
+        DeclareLaunchArgument('invert_lateral', default_value='true',
+                              description='Flip left/right (person faces the robot -> mirrored)'),
+        DeclareLaunchArgument('invert_forward', default_value='false',
+                              description='Flip toward/away if the robot drives fwd/back wrong'),
     ]
     viz = LaunchConfiguration('viz')
     use_compressed = LaunchConfiguration('use_compressed')
+    invert_lateral = LaunchConfiguration('invert_lateral')
+    invert_forward = LaunchConfiguration('invert_forward')
 
     # 1. webcam -> /<ns>/color/image_raw  (reuses webcam.launch.py)
     webcam = IncludeLaunchDescription(
@@ -92,7 +98,8 @@ def generate_launch_description():
         name='pointed_goal',
         namespace=namespace,
         output='screen',
-        parameters=[{'goal_frame': goal_frame, 'arm': arm}],
+        parameters=[{'goal_frame': goal_frame, 'arm': arm,
+                      'invert_lateral': invert_lateral, 'invert_forward': invert_forward}],
         # The sim publishes TF on /<ns>/tf, but a TransformListener defaults to the
         # global /tf. Remap so this namespaced node reads /<ns>/tf (else it never
         # sees map/base_link -> "map does not exist").

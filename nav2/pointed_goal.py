@@ -73,6 +73,11 @@ class PointedGoal(Node):
         self.declare_parameter("goal_frame", "map")          # map (sim) | odom (real)
         self.declare_parameter("robot_base_frame", "base_link")
         self.declare_parameter("camera_forward_offset", 0.0)  # m camera is ahead of base_link
+        # The person stands FACING the robot, so the camera view is mirrored.
+        # invert_lateral flips left/right (on by default to fix the mirror);
+        # invert_forward flips toward/away if the robot drives the wrong way fwd/back.
+        self.declare_parameter("invert_lateral", True)
+        self.declare_parameter("invert_forward", False)
         self.declare_parameter("min_goal_interval", 1.0)     # s between goals
         self.declare_parameter("min_goal_delta", 0.25)       # m; ignore near-identical goals
 
@@ -81,6 +86,8 @@ class PointedGoal(Node):
         self.goal_frame = gp("goal_frame").value
         self.base_frame = gp("robot_base_frame").value
         self.cam_fwd = float(gp("camera_forward_offset").value)
+        self.invert_lateral = bool(gp("invert_lateral").value)
+        self.invert_forward = bool(gp("invert_forward").value)
         self.min_goal_interval = float(gp("min_goal_interval").value)
         self.min_goal_delta = float(gp("min_goal_delta").value)
 
@@ -146,9 +153,16 @@ class PointedGoal(Node):
         if pose is None:
             return  # armed, but no valid pointing hit yet — keep waiting
 
-        # camera-optical (x right, y down, z fwd) -> base_link (x fwd, y left, z up)
-        bx = pose.position.z + self.cam_fwd
-        by = -pose.position.x
+        # camera-optical (x right, y down, z fwd) -> base_link (x fwd, y left, z up).
+        # Person faces the robot => mirrored view, so allow flipping each axis.
+        fwd = pose.position.z
+        lat = -pose.position.x
+        if self.invert_forward:
+            fwd = -fwd
+        if self.invert_lateral:
+            lat = -lat
+        bx = fwd + self.cam_fwd
+        by = lat
 
         pt = PointStamped()
         pt.header.frame_id = self.base_frame
