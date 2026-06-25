@@ -1,23 +1,10 @@
 {
-  "appId": "foxglove",
+  "appId": "com.patroldog.probe",
+  "name": "patrol-dog",
   "version": "0.1.0",
-  "platform": "linux",
-  "services": {
-    "recorder": {
-      "context": "./recorder",
-      "entitlements": [
-        { "type": "network", "mode": "host" },
-        { "type": "persist", "name": "rosbags", "path": "/data" }
-      ]
-    },
-    "nav2": {
-      "context": "./nav2",
-      "frameworks": {
-        "ros2": { "domainId": 0, "rmw": "rmw_cyclonedds_cpp", "distro": "humble" }
-      },
-      "entitlements": [
-        { "type": "network", "mode": "host" }
-      ]
-    }
-  }
+  "entitlements": [
+    { "type": "camera" },
+    { "type": "gpu" },
+    { "type": "network", "mode": "host" }
+  ]
 }

@@ -37,6 +37,7 @@ Run:
 import os
 import sys
 import math
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -84,6 +85,9 @@ L_HIP, R_HIP = 23, 24
 L_ELBOW, R_ELBOW = 13, 14
 L_WRIST, R_WRIST = 15, 16
 FOOT_IDX = (27, 28, 29, 30, 31, 32)  # ankles, heels, foot index
+
+ARMS_UP_HOLD_S  = 3.0  # both wrists must be above shoulders for this long to activate
+FILTER_WINDOW_S = 3.0  # epoch length for the pointing-location average
 
 
 def focal_px(width):
@@ -153,6 +157,17 @@ def ground_level_m(cam_pts, image_lms):
     if ys:
         return max(ys)          # +y is down, so the foot is the largest y
     return float(cam_pts[:, 1].max())
+
+
+def _both_arms_up(cam_pts, image_lms):
+    """True when both wrists are above (lower camera-y) their respective shoulders."""
+    for sh_idx, wr_idx in ((L_SHOULDER, L_WRIST), (R_SHOULDER, R_WRIST)):
+        if (image_lms[sh_idx].visibility < VIS_THRESHOLD or
+                image_lms[wr_idx].visibility < VIS_THRESHOLD):
+            return False
+        if cam_pts[wr_idx][1] >= cam_pts[sh_idx][1]:  # y-down: wrist must be smaller y
+            return False
+    return True
 
 
 def arm_ray_ground_hit(cam_pts, image_lms, elbow_idx, wrist_idx, y_ground):
@@ -227,6 +242,18 @@ class PoseNode(Node):
         self._pub_skel = self.create_publisher(MarkerArray, "/pose_skeleton", 10)
         self._pub_image = self.create_publisher(Image, "/annotated_image", sensor_qos)
 
+        # Arms-up activation gate (toggle: hold 3s to activate, hold 3s again to deactivate)
+        self._arms_up_since: float | None = None
+        self._gate_triggered = False  # prevents re-triggering while arms stay up
+        self._active = False
+
+        # 3-second epoch filter for pointed location
+        self._filter_epoch_start = 0.0
+        self._filter_left_buf:  list = []
+        self._filter_right_buf: list = []
+        self._filter_left_avg:  np.ndarray | None = None
+        self._filter_right_avg: np.ndarray | None = None
+
         self.get_logger().info(f"Subscribed to {topic}")
 
     def _image_cb(self, msg: Image):
@@ -265,18 +292,70 @@ class PoseNode(Node):
             cam_skeletons.append(pts)
 
         # --- pointed_location (person 0, in metres) ---
+        now = time.monotonic()
         left_hit = right_hit = None
+        arms_up = False
         if cam_skeletons and cam_skeletons[0] is not None:
             pts0 = cam_skeletons[0]
             y_ground = ground_level_m(pts0, result.pose_landmarks[0])
-            left_hit = arm_ray_ground_hit(pts0, result.pose_landmarks[0], L_ELBOW, L_WRIST, y_ground)
+            left_hit  = arm_ray_ground_hit(pts0, result.pose_landmarks[0], L_ELBOW, L_WRIST, y_ground)
             right_hit = arm_ray_ground_hit(pts0, result.pose_landmarks[0], R_ELBOW, R_WRIST, y_ground)
+            arms_up   = _both_arms_up(pts0, result.pose_landmarks[0])
+
+        # Arms-up toggle gate: track hold duration, fire once per raise/lower cycle
+        if arms_up:
+            if self._arms_up_since is None:
+                self._arms_up_since = now
+            if (not self._gate_triggered
+                    and now - self._arms_up_since >= ARMS_UP_HOLD_S):
+                self._gate_triggered = True
+                self._active = not self._active
+                if self._active:
+                    self._filter_epoch_start = now
+                    self._filter_left_buf.clear()
+                    self._filter_right_buf.clear()
+                else:
+                    self._filter_left_avg  = None
+                    self._filter_right_avg = None
+        else:
+            self._arms_up_since  = None
+            self._gate_triggered = False
 
         pa = PoseArray(header=header)
-        pa.poses = [
-            _hit_pose(left_hit) if left_hit is not None else _nan_pose(),
-            _hit_pose(right_hit) if right_hit is not None else _nan_pose(),
-        ]
+
+        # Show sentinel 99 while arms are raised (ARMING or DISARMING feedback)
+        if self._arms_up_since is not None:
+            sentinel = Pose(
+                position=Point(x=99.0, y=99.0, z=99.0),
+                orientation=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
+            )
+            pa.poses = [sentinel, sentinel]
+
+        elif self._active:
+            # Pointing active — collect hits and publish 3-second epoch averages
+            if left_hit  is not None:
+                self._filter_left_buf.append(left_hit)
+            if right_hit is not None:
+                self._filter_right_buf.append(right_hit)
+
+            if now - self._filter_epoch_start >= FILTER_WINDOW_S:
+                if self._filter_left_buf:
+                    self._filter_left_avg  = np.mean(self._filter_left_buf,  axis=0)
+                if self._filter_right_buf:
+                    self._filter_right_avg = np.mean(self._filter_right_buf, axis=0)
+                self._filter_epoch_start = now
+                self._filter_left_buf.clear()
+                self._filter_right_buf.clear()
+
+            pa.poses = [
+                _hit_pose(self._filter_left_avg)  if self._filter_left_avg  is not None else _nan_pose(),
+                _hit_pose(self._filter_right_avg) if self._filter_right_avg is not None else _nan_pose(),
+            ]
+
+        else:
+            # IDLE
+            pa.poses = [_nan_pose(), _nan_pose()]
+
         self._pub_points.publish(pa)
 
         # --- pose_skeleton MarkerArray (metric, constant size) ---
