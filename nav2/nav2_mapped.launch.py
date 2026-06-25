@@ -17,7 +17,8 @@ does not actually start there, give it the real start pose in RViz (2D Pose Esti
 or edit `initial_pose` in config/nav2_params_mapped.yaml.
 
 Args (override with name:=value): same lidar_* args as nav2.launch.py, plus
-  map   (default nav2/maps/map.yaml)  — the occupancy map to localize against.
+  map          (default nav2/maps/map.yaml)  — the occupancy map to localize against.
+  odom_source  (default utlidar)             — go2_odom source: utlidar | sportmodestate.
 """
 import os
 
@@ -39,6 +40,7 @@ def generate_launch_description():
     lidar_pitch = LaunchConfiguration("lidar_pitch")
     lidar_yaw = LaunchConfiguration("lidar_yaw")
     map_yaml = LaunchConfiguration("map")
+    odom_source = LaunchConfiguration("odom_source")
 
     p2l_params = os.path.join(HERE, "config", "pointcloud_to_laserscan.yaml")
     nav2_params = os.path.join(HERE, "config", "nav2_params_mapped.yaml")
@@ -53,11 +55,14 @@ def generate_launch_description():
         DeclareLaunchArgument("lidar_pitch", default_value="0.0"),
         DeclareLaunchArgument("lidar_yaw", default_value="0.0"),
         DeclareLaunchArgument("map", default_value=os.path.join(HERE, "maps", "map.yaml")),
+        DeclareLaunchArgument("odom_source", default_value="utlidar"),
     ]
 
-    # Odometry: /sportmodestate -> TF odom->base_link + /odom
+    # Odometry: utlidar (default) or sportmodestate -> TF odom->base_link + /odom
     go2_odom = ExecuteProcess(
-        cmd=["python3", os.path.join(HERE, "go2_odom.py")], output="screen")
+        cmd=["python3", os.path.join(HERE, "go2_odom.py"),
+             "--ros-args", "-p", ["odom_source:=", odom_source]],
+        output="screen")
 
     # Static base_link -> lidar frame
     static_tf = Node(

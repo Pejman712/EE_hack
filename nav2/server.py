@@ -1,166 +1,294 @@
-"""Go2 nav2 walker — a tiny web UI + JSON API that drives nav2 over the ros2 CLI.
+"""Go2 map-based nav2 server — a web map UI + JSON API that drives nav2 over the
+ros2 CLI.
 
-Mapless "walk N metres": the server launches the nav2 stack (nav2.launch.py) as
-a subprocess, then drives it purely with `ros2` CLI calls — exactly the pattern
-recorder/server.py uses for `ros2 bag record`. No rclpy in this process.
+This is the MAP-BASED counterpart to the mapless "walk N metres" walker: it
+launches the map-based nav2 stack (nav2_mapped.launch.py — map_server + AMCL +
+the nav2 servers + cmd_vel->sport bridge) as a subprocess, loads a saved
+occupancy map (yaml + pgm) from a path you provide, and serves a web page that
+renders that map so you can:
 
-  GET  /                  control UI (enter x/y, Walk, Stop)
-  GET  /api/nav/status    nav2 up? + currently walking? + last result
-  POST /api/nav/walk      {"x": X, "y": Y}  -> ros2 action send_goal navigate_to_pose
-  POST /api/nav/stop      cancel the goal + StopMove the dog
+  * set the INITIAL pose  — click/drag on the map (or type x/y/yaw) -> /initialpose
+        (geometry_msgs/PoseWithCovarianceStamped) which AMCL uses to (re)localise.
+  * set the GOAL pose     — click/drag on the map (or type x/y/yaw) -> a
+        NavigateToPose goal in the **map** frame (absolute map coordinates).
+  * watch the LIVE robot pose — the map->base_link TF (AMCL + utlidar odom),
+        drawn as a moving marker/arrow.
 
-"Walk to (x, y)" sends a NavigateToPose goal at the point (x forward, y left)
-relative to the robot's CURRENT pose, in the **base_link** frame — so nav2 (whose
-costmaps live in `odom`) plans from wherever the robot is right now, with no map
-and no fixed origin. (x, 0) is the old "walk x metres". The goal's final heading
-faces the target direction (yaw = atan2(y, x)). The controller's /cmd_vel is
-turned into Go2 sport Move commands by cmd_vel_to_sport.py (launched inside
-nav2.launch.py).
+Everything is driven purely with `ros2` CLI calls (same pattern as the recorder
+and the mapless walker) — no rclpy in this process.
+
+  GET  /                       map control UI
+  GET  /api/map/meta           map yaml metadata (resolution, origin, size)
+  GET  /api/map/image.png      the occupancy map rendered as PNG (for the canvas)
+  GET  /api/nav/status         nav2 up? + navigating? + last result + live pose
+  POST /api/nav/initialpose    {"x":X,"y":Y,"yaw":YAW}  -> publish /initialpose
+  POST /api/nav/goal           {"x":X,"y":Y,"yaw":YAW}  -> NavigateToPose (map frame)
+  POST /api/nav/stop           cancel the goal + StopMove the dog
+
+Env:
+  MAP_YAML      path to the map .yaml (default ./maps/map.yaml; its `image:` is
+                resolved relative to the yaml). The matching .pgm sits beside it.
+  ODOM_SOURCE   utlidar (default) | sportmodestate — passed to nav2_mapped.launch.py.
+  PORT          web server port (default 7100).
 """
+import io
 import math
 import os
+import re
 import signal
 import subprocess
+import threading
 import time
 
 import uvicorn
+import yaml
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
+from PIL import Image
 from pydantic import BaseModel
 
 PORT = int(os.environ.get("PORT", "7100"))
 HERE = os.path.dirname(os.path.abspath(__file__))
-LAUNCH_FILE = os.path.join(HERE, "nav2.launch.py")
+LAUNCH_FILE = os.path.join(HERE, "nav2_mapped.launch.py")
+MAP_YAML = os.environ.get("MAP_YAML", os.path.join(HERE, "maps", "map.yaml"))
+ODOM_SOURCE = os.environ.get("ODOM_SOURCE", "utlidar")
 
 NAV_ACTION = "/navigate_to_pose"
 NAV_ACTION_TYPE = "nav2_msgs/action/NavigateToPose"
-# Action cancel service + the "cancel all goals" request (zero goal_id + zero
-# stamp). Calling the server directly is authoritative — it doesn't depend on the
-# send_goal CLI client cancelling on Ctrl-C (which varies across Humble builds).
 NAV_CANCEL_SRV = "/navigate_to_pose/_action/cancel_goal"
 NAV_CANCEL_TYPE = "action_msgs/srv/CancelGoal"
 NAV_CANCEL_ALL = "{goal_info: {goal_id: {uuid: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}, stamp: {sec: 0, nanosec: 0}}}"
+INITIALPOSE_TOPIC = "/initialpose"
+INITIALPOSE_TYPE = "geometry_msgs/msg/PoseWithCovarianceStamped"
 SPORT_TOPIC = "/api/sport/request"
 SPORT_TYPE = "unitree_api/msg/Request"
 SPORT_API_ID_STOP = 1003
 
-MAX_RANGE = 10.0  # sanity clamp on the goal distance (metres) for a single command
+# AMCL initial-pose covariance: modest confidence in x,y (0.25 m^2) and yaw
+# (~0.068 rad^2) — the same diagonal RViz's "2D Pose Estimate" tool sends.
+COV_XX, COV_YY, COV_YAW = 0.25, 0.25, 0.06853892326654787
 
-app = FastAPI(title="go2-nav2-walker")
+app = FastAPI(title="go2-nav2-map")
 
-# Long-lived nav2 stack + the single in-flight walk goal.
-_nav = {"launch": None, "walk": None, "x": None, "y": None, "started": None, "result": None}
-
-
-class WalkReq(BaseModel):
-    x: float = 0.0  # metres forward (base_link +x)
-    y: float = 0.0  # metres left    (base_link +y)
+# Long-lived nav2 stack + the single in-flight goal + latest robot pose.
+_nav = {"launch": None, "goal": None, "x": None, "y": None, "yaw": None,
+        "started": None, "result": None, "pose": None}
+_map = {"meta": None, "png": None, "png_mtime": None}
 
 
+class PoseReq(BaseModel):
+    x: float = 0.0     # metres, map frame
+    y: float = 0.0
+    yaw: float = 0.0   # radians, map frame (0 = +x)
+
+
+# ----------------------------------------------------------------------------- map
+def _load_map_meta() -> dict:
+    """Parse the map yaml once; resolve the image path relative to the yaml."""
+    if _map["meta"] is not None:
+        return _map["meta"]
+    with open(MAP_YAML) as f:
+        y = yaml.safe_load(f)
+    image = y["image"]
+    if not os.path.isabs(image):
+        image = os.path.join(os.path.dirname(os.path.abspath(MAP_YAML)), image)
+    with Image.open(image) as im:
+        w, h = im.size
+    res = float(y["resolution"])
+    ox, oy = float(y["origin"][0]), float(y["origin"][1])
+    oyaw = float(y["origin"][2]) if len(y["origin"]) > 2 else 0.0
+    _map["meta"] = {
+        "map_yaml": MAP_YAML, "image": image,
+        "resolution": res, "origin": [ox, oy, oyaw],
+        "width": w, "height": h,
+        # world extent of the image (origin is the bottom-left corner)
+        "bounds": {"min_x": ox, "min_y": oy,
+                   "max_x": ox + w * res, "max_y": oy + h * res},
+    }
+    return _map["meta"]
+
+
+def _map_png() -> bytes:
+    """Render the occupancy .pgm to PNG bytes (cached on the image's mtime)."""
+    meta = _load_map_meta()
+    mtime = os.path.getmtime(meta["image"])
+    if _map["png"] is None or _map["png_mtime"] != mtime:
+        with Image.open(meta["image"]) as im:
+            buf = io.BytesIO()
+            im.convert("L").save(buf, format="PNG")
+        _map["png"], _map["png_mtime"] = buf.getvalue(), mtime
+    return _map["png"]
+
+
+# --------------------------------------------------------------------------- nav2
 def _launch_alive() -> bool:
     p = _nav["launch"]
     return p is not None and p.poll() is None
 
 
-def _is_walking() -> bool:
-    p = _nav["walk"]
+def _is_navigating() -> bool:
+    p = _nav["goal"]
     return p is not None and p.poll() is None
 
 
 def _start_nav2():
-    """Spawn `ros2 launch nav2.launch.py` in its own process group so the whole
-    nav2 tree can be signalled/torn down together."""
+    """Spawn `ros2 launch nav2_mapped.launch.py map:=.. odom_source:=..` in its
+    own session so the whole nav2 tree can be torn down together."""
     if _launch_alive():
         return
     _nav["launch"] = subprocess.Popen(
-        ["ros2", "launch", LAUNCH_FILE],
+        ["ros2", "launch", LAUNCH_FILE,
+         f"map:={MAP_YAML}", f"odom_source:={ODOM_SOURCE}"],
         start_new_session=True,
     )
-    print(f"[nav2] launched {LAUNCH_FILE} (pid={_nav['launch'].pid})", flush=True)
+    print(f"[nav2] launched {LAUNCH_FILE} map={MAP_YAML} odom={ODOM_SOURCE} "
+          f"(pid={_nav['launch'].pid})", flush=True)
 
 
 def _stop_dog():
-    """Publish a one-shot StopMove so the dog halts immediately, independent of
-    whether the action cancel propagated through the controller yet."""
+    """One-shot StopMove so the dog halts immediately, regardless of whether the
+    action cancel has propagated through the controller yet."""
     msg = "{header: {identity: {api_id: %d}}}" % SPORT_API_ID_STOP
     try:
         subprocess.run(
             ["ros2", "topic", "pub", "--once", SPORT_TOPIC, SPORT_TYPE, msg],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8,
-        )
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _quat(yaw: float):
+    return math.sin(yaw / 2.0), math.cos(yaw / 2.0)  # (z, w)
+
+
+# Live robot pose: tail `tf2_echo map base_link` and keep the latest x/y/yaw.
+_TRANS_RE = re.compile(r"Translation:\s*\[\s*([-\d.eE]+),\s*([-\d.eE]+)")
+_QUAT_RE = re.compile(r"Quaternion\s*\[\s*([-\d.eE]+),\s*([-\d.eE]+),\s*([-\d.eE]+),\s*([-\d.eE]+)")
+
+
+def _pose_poller():
+    """Run tf2_echo and parse map->base_link into _nav['pose'] (~1 Hz). Restarts
+    the subprocess if it dies (e.g. TF not available until AMCL is active)."""
+    while True:
+        try:
+            proc = subprocess.Popen(
+                ["ros2", "run", "tf2_ros", "tf2_echo", "map", "base_link"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                start_new_session=True)
+        except Exception:  # noqa: BLE001
+            time.sleep(3)
+            continue
+        tx = ty = None
+        for line in proc.stdout:
+            m = _TRANS_RE.search(line)
+            if m:
+                tx, ty = float(m.group(1)), float(m.group(2))
+                continue
+            q = _QUAT_RE.search(line)
+            if q and tx is not None:
+                qz, qw = float(q.group(3)), float(q.group(4))
+                yaw = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
+                _nav["pose"] = {"x": tx, "y": ty, "yaw": yaw, "t": time.time()}
+                tx = ty = None
+        proc.wait()
+        time.sleep(2)  # TF dropped — wait and re-attach
+
+
+# ---------------------------------------------------------------------------- API
+@app.get("/api/map/meta")
+def api_map_meta() -> dict:
+    try:
+        return {"ok": True, **_load_map_meta()}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"could not load map {MAP_YAML}: {e}")
+
+
+@app.get("/api/map/image.png")
+def api_map_image() -> Response:
+    try:
+        return Response(content=_map_png(), media_type="image/png")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"could not render map image: {e}")
 
 
 @app.get("/api/nav/status")
 def api_status() -> dict:
-    p = _nav["walk"]
+    p = _nav["goal"]
     if p is not None and p.poll() is not None and _nav["result"] is None:
         _nav["result"] = "ok" if p.returncode == 0 else f"exit {p.returncode}"
+    pose = _nav["pose"]
+    if pose and time.time() - pose["t"] > 5.0:
+        pose = None  # stale — TF stopped flowing
     return {
         "nav2_up": _launch_alive(),
-        "walking": _is_walking(),
-        "x": _nav["x"],
-        "y": _nav["y"],
+        "navigating": _is_navigating(),
+        "goal": None if _nav["x"] is None else {"x": _nav["x"], "y": _nav["y"], "yaw": _nav["yaw"]},
         "started": _nav["started"],
         "result": _nav["result"],
+        "pose": pose,
     }
 
 
-@app.post("/api/nav/walk")
-def api_walk(req: WalkReq) -> dict:
+@app.post("/api/nav/initialpose")
+def api_initialpose(req: PoseReq) -> dict:
     if not _launch_alive():
         raise HTTPException(503, "nav2 stack not running yet — try again in a few seconds")
-    if _is_walking():
-        raise HTTPException(409, "already walking — stop first")
-    x, y = float(req.x), float(req.y)
-    dist = math.hypot(x, y)
-    if dist == 0.0 or dist > MAX_RANGE:
-        raise HTTPException(
-            400, f"goal must be non-zero and within {MAX_RANGE} m of the robot (got {dist:.2f} m)"
-        )
+    x, y, yaw = float(req.x), float(req.y), float(req.yaw)
+    qz, qw = _quat(yaw)
+    cov = [0.0] * 36
+    cov[0], cov[7], cov[35] = COV_XX, COV_YY, COV_YAW
+    msg = (
+        "{header: {frame_id: 'map'}, pose: {pose: {position: {x: %f, y: %f, z: 0.0}, "
+        "orientation: {x: 0.0, y: 0.0, z: %f, w: %f}}, covariance: [%s]}}"
+        % (x, y, qz, qw, ", ".join(str(c) for c in cov))
+    )
+    # Publish a few times — AMCL may not have subscribed the instant we fire.
+    subprocess.Popen(
+        ["ros2", "topic", "pub", "--times", "3", "--rate", "2",
+         INITIALPOSE_TOPIC, INITIALPOSE_TYPE, msg],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {"ok": True, "x": x, "y": y, "yaw": yaw}
 
-    # Goal at (x forward, y left) in base_link, facing the target direction
-    # (yaw = atan2(y, x)). nav2 transforms it into the odom costmap frame at goal
-    # time, so it's relative to wherever the dog is right now.
-    yaw = math.atan2(y, x)
-    qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+
+@app.post("/api/nav/goal")
+def api_goal(req: PoseReq) -> dict:
+    if not _launch_alive():
+        raise HTTPException(503, "nav2 stack not running yet — try again in a few seconds")
+    if _is_navigating():
+        raise HTTPException(409, "already navigating — stop first")
+    x, y, yaw = float(req.x), float(req.y), float(req.yaw)
+    qz, qw = _quat(yaw)
     goal = (
-        "{pose: {header: {frame_id: base_link}, "
+        "{pose: {header: {frame_id: 'map'}, "
         "pose: {position: {x: %f, y: %f, z: 0.0}, "
         "orientation: {x: 0.0, y: 0.0, z: %f, w: %f}}}}" % (x, y, qz, qw)
     )
-    # send_goal blocks until the goal finishes; run it in its own process group
-    # so Stop can SIGINT it (the ros2 CLI cancels the goal on Ctrl-C).
-    _nav["walk"] = subprocess.Popen(
+    # send_goal blocks until the goal finishes; own process group so Stop can SIGINT it.
+    _nav["goal"] = subprocess.Popen(
         ["ros2", "action", "send_goal", NAV_ACTION, NAV_ACTION_TYPE, goal],
         start_new_session=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    _nav.update(x=x, y=y, started=time.strftime("%Y-%m-%d %H:%M:%S"), result=None)
-    return {"ok": True, "x": x, "y": y}
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _nav.update(x=x, y=y, yaw=yaw, started=time.strftime("%Y-%m-%d %H:%M:%S"), result=None)
+    return {"ok": True, "x": x, "y": y, "yaw": yaw}
 
 
 @app.post("/api/nav/stop")
 def api_stop() -> dict:
-    # 1. Authoritatively cancel every active goal on the action server itself.
     cancelled = False
     try:
         subprocess.run(
             ["ros2", "service", "call", NAV_CANCEL_SRV, NAV_CANCEL_TYPE, NAV_CANCEL_ALL],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
-        )
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         cancelled = True
     except Exception:  # noqa: BLE001
         pass
-    # 2. Tear down the send_goal CLI client so it stops waiting on the result.
-    p = _nav["walk"]
+    p = _nav["goal"]
     if p is not None and p.poll() is None:
         try:
             os.killpg(os.getpgid(p.pid), signal.SIGINT)
         except Exception:  # noqa: BLE001
             pass
-    # 3. Belt-and-suspenders: halt the dog immediately, regardless of the above.
     _stop_dog()
     _nav["result"] = "stopped"
     return {"ok": True, "cancelled": cancelled}
@@ -168,76 +296,198 @@ def api_stop() -> dict:
 
 PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Go2 nav2 Walker</title>
+<title>Go2 Map Nav</title>
 <style>
   :root{--bg:#0c0e12;--panel:#14171d;--ink:#e7ebf0;--muted:#9aa6b2;--line:#262c36;
-    --teal:#2dd4bf;--bad:#ff6b6b;}
+    --teal:#2dd4bf;--green:#67e480;--bad:#ff6b6b;--amber:#ffb429;}
   *{box-sizing:border-box;} body{margin:0;background:var(--bg);color:var(--ink);
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;line-height:1.5;}
-  .wrap{max-width:680px;margin:0 auto;padding:28px 20px 60px;}
-  h1{font-size:23px;font-weight:800;margin:0 0 2px;} .sub{color:var(--muted);font-size:14px;margin:0 0 22px;}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px;}
-  label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px;}
-  input{width:160px;background:#0c0e12;border:1px solid var(--line);border-radius:10px;
-    color:var(--ink);font-size:20px;padding:10px 12px;font-weight:700;}
-  .row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;}
-  button{border:none;border-radius:10px;padding:13px 22px;font-weight:800;font-size:15px;cursor:pointer;}
-  .go{background:linear-gradient(92deg,var(--teal),#7af0e0);color:#0c0e12;}
+  .wrap{max-width:980px;margin:0 auto;padding:24px 20px 60px;}
+  h1{font-size:23px;font-weight:800;margin:0 0 2px;} .sub{color:var(--muted);font-size:14px;margin:0 0 18px;}
+  .grid{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;}
+  .mapcard{padding:12px;}
+  canvas{display:block;border-radius:8px;background:#0c0e12;cursor:crosshair;max-width:100%;touch-action:none;}
+  label{display:block;font-size:12px;color:var(--muted);margin:0 0 5px;}
+  input{width:90px;background:#0c0e12;border:1px solid var(--line);border-radius:9px;
+    color:var(--ink);font-size:16px;padding:8px 10px;font-weight:700;}
+  .row{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-bottom:12px;}
+  .seg button{background:transparent;color:var(--muted);border:none;padding:9px 16px;font-weight:800;font-size:13px;cursor:pointer;}
+  .seg button.on.init{background:var(--green);color:#0c0e12;}
+  .seg button.on.goal{background:var(--teal);color:#0c0e12;}
+  button{border:none;border-radius:10px;padding:11px 18px;font-weight:800;font-size:14px;cursor:pointer;}
+  .send.init{background:var(--green);color:#0c0e12;} .send.goal{background:var(--teal);color:#0c0e12;}
   .stop{background:linear-gradient(92deg,#ff6b6b,#ff9a8b);color:#0c0e12;}
   button:disabled{opacity:.45;cursor:not-allowed;}
-  .status{margin-top:16px;font-size:14px;color:var(--muted);}
+  h3{font-size:13px;margin:0 0 10px;letter-spacing:.04em;text-transform:uppercase;}
+  h3.init{color:var(--green);} h3.goal{color:var(--teal);}
+  .status{margin-top:14px;font-size:13px;color:var(--muted);}
   .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#444;margin-right:7px;vertical-align:middle;}
   .dot.on{background:var(--teal);box-shadow:0 0 8px var(--teal);animation:pulse 1s infinite;}
-  .dot.warn{background:#ffb429;}
+  .dot.warn{background:var(--amber);}
   @keyframes pulse{50%{opacity:.4;}}
   code{font-family:ui-monospace,Menlo,monospace;color:#cfe9e3;}
+  .hint{font-size:12px;color:var(--muted);margin:8px 0 0;}
+  .leg{font-size:12px;color:var(--muted);margin-top:8px;}
+  .sw{display:inline-block;width:10px;height:10px;border-radius:50%;margin:0 5px 0 12px;vertical-align:middle;}
 </style></head><body><div class="wrap">
-  <h1>🐕 Go2 nav2 Walker</h1>
-  <p class="sub">Mapless nav2 — give a point <code>(x, y)</code> relative to the dog
-    now (x forward, y left) and it plans there, avoiding what the L1 sees.
-    Negative values go backward / right.</p>
+  <h1>🗺️ Go2 Map Navigation</h1>
+  <p class="sub">Map-based nav2 on the real Go2 (utlidar odometry). Pick a mode, then
+    <b>click+drag on the map</b> (click = position, drag = heading) — or type values — to set the
+    <b style="color:var(--green)">initial pose</b> (tells AMCL where the dog is) and the
+    <b style="color:var(--teal)">goal</b> (where to walk, in absolute map metres).</p>
 
-  <div class="card">
-    <div class="row">
-      <div>
-        <label for="x">x — forward (m)</label>
-        <input id="x" type="number" step="0.25" value="1.0">
+  <div class="grid">
+    <div class="card mapcard">
+      <div class="seg">
+        <button id="mInit" class="on init" onclick="setMode('init')">◎ Initial pose</button>
+        <button id="mGoal" class="goal" onclick="setMode('goal')">▸ Goal</button>
       </div>
-      <div>
-        <label for="y">y — left (m)</label>
-        <input id="y" type="number" step="0.25" value="0.0">
+      <canvas id="cv" width="600" height="400"></canvas>
+      <div class="leg">
+        <span class="sw" style="background:var(--green)"></span>initial
+        <span class="sw" style="background:var(--teal)"></span>goal
+        <span class="sw" style="background:var(--amber)"></span>robot (live)
       </div>
-      <button class="go" id="goBtn" onclick="walk()">Walk ▸</button>
-      <button class="stop" id="stopBtn" onclick="stop()">■ Stop</button>
+      <div class="status" id="status"><span class="dot" id="dot"></span>—</div>
     </div>
-    <div class="status" id="status"><span class="dot" id="dot"></span>—</div>
+
+    <div style="display:flex;flex-direction:column;gap:18px;flex:1;min-width:230px;">
+      <div class="card">
+        <h3 class="init">◎ Initial pose</h3>
+        <div class="row">
+          <div><label>x (m)</label><input id="ix" type="number" step="0.1" value="0.0"></div>
+          <div><label>y (m)</label><input id="iy" type="number" step="0.1" value="0.0"></div>
+          <div><label>yaw (rad)</label><input id="iyaw" type="number" step="0.1" value="0.0"></div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button class="send init" onclick="sendInit()">Set initial pose</button>
+        </div>
+        <p class="hint">Publishes <code>/initialpose</code> → AMCL relocalises here.</p>
+      </div>
+
+      <div class="card">
+        <h3 class="goal">▸ Goal</h3>
+        <div class="row">
+          <div><label>x (m)</label><input id="gx" type="number" step="0.1" value="1.0"></div>
+          <div><label>y (m)</label><input id="gy" type="number" step="0.1" value="0.0"></div>
+          <div><label>yaw (rad)</label><input id="gyaw" type="number" step="0.1" value="0.0"></div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button class="send goal" id="goBtn" onclick="sendGoal()">Send goal ▸</button>
+          <button class="stop" onclick="stop()">■ Stop</button>
+        </div>
+        <p class="hint">Sends <code>NavigateToPose</code> in the <code>map</code> frame (absolute).</p>
+      </div>
+    </div>
   </div>
 </div>
 <script>
+  const cv=document.getElementById("cv"), ctx=cv.getContext("2d");
+  let META=null, IMG=null, scale=1, mode="init";
+  let initPose=null, goalPose=null, robot=null, drag=null;
+
   async function j(u,m,b){const o={method:m||"GET"};
     if(b){o.headers={"Content-Type":"application/json"};o.body=JSON.stringify(b);}
     const r=await fetch(u,o);return r.json().catch(()=>({}));}
-  async function walk(){
-    const x=parseFloat(document.getElementById("x").value);
-    const y=parseFloat(document.getElementById("y").value);
+
+  function setMode(x){mode=x;
+    document.getElementById("mInit").className="init"+(x==="init"?" on":"");
+    document.getElementById("mGoal").className="goal"+(x==="goal"?" on":"");}
+
+  // world<->image-pixel<->canvas mappings (origin = bottom-left of the image)
+  function worldToCanvas(wx,wy){
+    const ipx=(wx-META.origin[0])/META.resolution;
+    const ipy=META.height-(wy-META.origin[1])/META.resolution;
+    return [ipx*scale, ipy*scale];}
+  function canvasToWorld(cx,cy){
+    const ipx=cx/scale, ipy=cy/scale;
+    return [META.origin[0]+ipx*META.resolution,
+            META.origin[1]+(META.height-ipy)*META.resolution];}
+
+  function arrow(cx,cy,yaw,color){
+    const len=22;
+    ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=3;
+    ctx.beginPath();ctx.arc(cx,cy,6,0,7);ctx.fill();
+    const ex=cx+len*Math.cos(-yaw), ey=cy+len*Math.sin(-yaw); // canvas y is down
+    ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(ex,ey);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(ex,ey);
+    ctx.lineTo(ex-9*Math.cos(-yaw-0.5),ey-9*Math.sin(-yaw-0.5));
+    ctx.lineTo(ex-9*Math.cos(-yaw+0.5),ey-9*Math.sin(-yaw+0.5));
+    ctx.closePath();ctx.fill();}
+
+  function redraw(){
+    if(!IMG)return;
+    ctx.clearRect(0,0,cv.width,cv.height);
+    ctx.drawImage(IMG,0,0,cv.width,cv.height);
+    if(initPose){const[x,y]=worldToCanvas(initPose.x,initPose.y);arrow(x,y,initPose.yaw,"#67e480");}
+    if(goalPose){const[x,y]=worldToCanvas(goalPose.x,goalPose.y);arrow(x,y,goalPose.yaw,"#2dd4bf");}
+    if(robot){const[x,y]=worldToCanvas(robot.x,robot.y);arrow(x,y,robot.yaw,"#ffb429");}
+    if(drag){const c=mode==="init"?"#67e480":"#2dd4bf";arrow(drag.cx,drag.cy,drag.yaw,c);}
+  }
+
+  function fillInputs(p,which){
+    document.getElementById(which+"x").value=p.x.toFixed(2);
+    document.getElementById(which+"y").value=p.y.toFixed(2);
+    document.getElementById(which+"yaw").value=p.yaw.toFixed(2);}
+
+  function evtXY(e){const r=cv.getBoundingClientRect();
+    const t=e.touches?e.touches[0]:e;
+    return [(t.clientX-r.left)*(cv.width/r.width),(t.clientY-r.top)*(cv.height/r.height)];}
+
+  function down(e){e.preventDefault();const[cx,cy]=evtXY(e);drag={cx,cy,yaw:0};redraw();}
+  function move(e){if(!drag)return;e.preventDefault();const[cx,cy]=evtXY(e);
+    drag.yaw=Math.atan2(-(cy-drag.cy),cx-drag.cx);redraw();}
+  function up(e){if(!drag)return;e.preventDefault();
+    const[wx,wy]=canvasToWorld(drag.cx,drag.cy);
+    const p={x:wx,y:wy,yaw:drag.yaw};
+    if(mode==="init"){initPose=p;fillInputs(p,"i");}else{goalPose=p;fillInputs(p,"g");}
+    drag=null;redraw();}
+
+  cv.addEventListener("mousedown",down);cv.addEventListener("mousemove",move);
+  window.addEventListener("mouseup",up);
+  cv.addEventListener("touchstart",down,{passive:false});
+  cv.addEventListener("touchmove",move,{passive:false});
+  cv.addEventListener("touchend",up,{passive:false});
+
+  function readInputs(which){return{
+    x:parseFloat(document.getElementById(which+"x").value)||0,
+    y:parseFloat(document.getElementById(which+"y").value)||0,
+    yaw:parseFloat(document.getElementById(which+"yaw").value)||0};}
+
+  async function sendInit(){const p=readInputs("i");initPose=p;redraw();
+    const d=await j("/api/nav/initialpose","POST",p);
+    if(d&&d.detail)setStatus("warn","error: "+d.detail);else setStatus("","initial pose sent → AMCL relocalising");}
+  async function sendGoal(){const p=readInputs("g");goalPose=p;redraw();
     const btn=document.getElementById("goBtn");btn.disabled=true;
-    try{const d=await j("/api/nav/walk","POST",{x:x,y:y});
-      if(d&&d.detail){setStatus("warn","error: "+d.detail);}}
-    finally{setTimeout(()=>{btn.disabled=false;refresh();},400);}
-  }
+    try{const d=await j("/api/nav/goal","POST",p);
+      if(d&&d.detail)setStatus("warn","error: "+d.detail);}
+    finally{setTimeout(()=>{btn.disabled=false;refresh();},400);}}
   async function stop(){await j("/api/nav/stop","POST");setTimeout(refresh,300);}
+
   function setStatus(cls,txt){
-    document.getElementById("dot").className="dot"+(cls?" "+cls:"");
     document.getElementById("status").innerHTML=
-      "<span class='dot"+(cls?" "+cls:"")+"'></span>"+txt;
-  }
+      "<span class='dot"+(cls?" "+cls:"")+"'></span>"+txt;}
+
   async function refresh(){
     const s=await j("/api/nav/status");
+    robot=s.pose?{x:s.pose.x,y:s.pose.y,yaw:s.pose.yaw}:null;redraw();
     if(!s.nav2_up){setStatus("warn","nav2 starting up…");return;}
-    if(s.walking){setStatus("on","walking to ("+s.x+", "+s.y+") m (since "+s.started+")");}
-    else{setStatus("","idle"+(s.result?" — last: "+s.result:"")+" · nav2 ready");}
+    let m=robot?"":"  (no robot pose yet — set an initial pose)";
+    if(s.navigating)setStatus("on","navigating → ("+s.goal.x.toFixed(2)+", "+s.goal.y.toFixed(2)+") m"+m);
+    else setStatus("","idle"+(s.result?" — last: "+s.result:"")+" · nav2 ready"+m);}
+
+  async function boot(){
+    META=await j("/api/map/meta");
+    if(!META||!META.ok){setStatus("warn","map not loaded — check MAP_YAML");return;}
+    // size the canvas to the map aspect, capped at 600px wide
+    const W=Math.min(600,META.width), H=Math.round(W*META.height/META.width);
+    cv.width=W;cv.height=H;scale=W/META.width;
+    IMG=new Image();IMG.onload=redraw;IMG.src="/api/map/image.png?ts="+Date.now();
+    refresh();setInterval(refresh,1000);
   }
-  refresh();setInterval(refresh,1500);
+  boot();
 </script></body></html>"""
 
 
@@ -248,12 +498,12 @@ def index() -> str:
 
 def _bootstrap():
     # Give DDS discovery a moment so go2_odom/scan find the robot, then bring up
-    # the nav2 stack. Walks are accepted once the action server is alive.
+    # the map-based nav2 stack and start tailing the robot pose.
     time.sleep(4)
     _start_nav2()
+    threading.Thread(target=_pose_poller, daemon=True).start()
 
 
 if __name__ == "__main__":
-    import threading
     threading.Thread(target=_bootstrap, daemon=True).start()
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info", access_log=False)

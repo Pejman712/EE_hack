@@ -2,6 +2,11 @@
 
 ## ⭐ Quick start — map-based navigation, no camera
 
+> **Want a web map UI instead of the CLI?** See **[nav2/MAP_NAV.md](nav2/MAP_NAV.md)**:
+> a web page that loads your map, sets the **initial** + **goal** pose by click or
+> typing, and shows the dog's live pose — driven by the same stack, with **utlidar**
+> odometry. Runs as the `nav2` Wendy service on `:7100`.
+
 Localize in your saved map and drive to a point you choose. **No camera / pointing.**
 
 ```bash

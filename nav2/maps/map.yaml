@@ -1,7 +1,13 @@
 image: map.pgm
 mode: trinary
 resolution: 0.05
-origin: [-24.7906, -10.4583, 0.0]
+# origin = [x, y, yaw] transform between map zero and the robot's start, i.e. the
+# Go2's pose in the odom frame at startup as measured on /odometry/filtered:
+#   position    x=-0.018257093714138608, y=-3.069646949317893e-06, z=0.0
+#   orientation quaternion (x,y,z,w)=(0, 0, -0.0030591102795856037, 0.9999953209112017)
+#               -> yaw = -0.006118230101754829 rad
+# AMCL's initial_pose stays (0,0,0); this origin aligns the map to where the dog starts.
+origin: [-0.018257093714138608, -0.000003069646949317893, -0.006118230101754829]
 negate: 0
 occupied_thresh: 0.65
 free_thresh: 0.25

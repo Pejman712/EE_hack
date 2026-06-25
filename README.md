@@ -145,48 +145,52 @@ Preconditions (same as any sport command): the robot must hold the sport lease a
 be in normal sport mode (not AI/advanced mode, not damped), standing on a flat,
 clear area before you trigger it. `Sit` from another posture may no-op.
 
-## nav2 (`walk to (x, y)` from a web UI) — mapless
+## nav2 (map navigation from a web UI)
 
-The `nav2` service drives the Go2 with the full **nav2** stack and exposes a tiny
-web UI with two boxes — **x** (forward) and **y** (left): type a point, press
-**Walk**, and the dog plans and walks to it — steering around whatever the bottom
-**L1** sees. **Mapless on purpose:** no SLAM, no saved map, no AMCL. Both nav2
-costmaps are rolling windows in the `odom` frame, and the goal is sent as a
-`NavigateToPose` at `(x, y)` in the **`base_link`** frame, facing the target
-(yaw = `atan2(y, x)`), so it's always relative to wherever the robot is at that
-moment. `(x, 0)` is the old "walk x metres". `odom` drifts, but for short relative
-walks that's fine. (To navigate on a persistent map instead, run the `slam/` stack
-and switch the costmaps' `global_frame` to `map`.)
+The `nav2` service drives the Go2 with the full **nav2** stack and serves a **web
+map UI**: load your saved map (`yaml`+`pgm`), **set the initial pose** so AMCL
+knows where the dog is, then **set a goal** — click+drag on the map or type
+`x/y/yaw` — and watch the dog's **live pose** move on the map as it walks there in
+absolute map coordinates, steering around whatever the bottom **L1** sees.
+Odometry is the **L1 utlidar** (`/utlidar/robot_odom`); localization is AMCL
+against the map. Full guide: **[nav2/MAP_NAV.md](nav2/MAP_NAV.md)**.
 
 ```
-                          ┌──────────────── nav2.launch.py ────────────────┐
-/sportmodestate ─ go2_odom ─▶ TF odom→base_link + /odom ─┐                  │
-/utlidar/cloud_deskewed ─ pointcloud_to_laserscan ─▶ /scan ─┤              │
-                                                            ▼              │
-                              nav2 (controller/planner/behaviors/bt) ─▶ /cmd_vel
-                                                                          │  │
-   server.py ── ros2 action send_goal /navigate_to_pose ────────────────▶│  │
-   (FastAPI, :7100)                                                          ▼
-                              cmd_vel_to_sport.py ── /cmd_vel → /api/sport/request Move
-                          └──────────────────────────────────────────────────┘
+                       ┌──────────── nav2_mapped.launch.py ────────────┐
+/utlidar/robot_odom ─ go2_odom ─▶ TF odom→base_link + /odom ─┐         │
+/utlidar/cloud_deskewed ─ pointcloud_to_laserscan ─▶ /scan ─┤         │
+   maps/*.yaml ─ map_server ─▶ /map ─ amcl ─▶ TF map→odom ──┤         │
+                                                            ▼         │
+                           nav2 (controller/planner/behaviors/bt) ─▶ /cmd_vel
+   server.py ── /initialpose (AMCL) ──────────────────────▶│         │  │
+   (FastAPI, :7100, web map) ── send_goal /navigate_to_pose (map) ───▶│  ▼
+                           cmd_vel_to_sport.py ── /cmd_vel → /api/sport/request Move
+                       └──────────────────────────────────────────────────┘
 ```
 
 **Everything is driven over the `ros2` CLI** — the same subprocess pattern
 `recorder/server.py` uses. `server.py` (FastAPI on `:7100`) launches
-`nav2.launch.py` as a subprocess, then:
+`nav2_mapped.launch.py` (`MAP_YAML`, `ODOM_SOURCE` env), renders the map, and:
 
-- **Walk** → `ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose`
-  with the goal pose at `(x, y)` in `base_link` (range clamped to 10 m).
+- **Initial pose** → `ros2 topic pub /initialpose geometry_msgs/.../PoseWithCovarianceStamped`
+  (in `map`) → AMCL relocalises there.
+- **Goal** → `ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose`
+  with the pose in the **`map`** frame (absolute).
 - **Stop** → `ros2 service call /navigate_to_pose/_action/cancel_goal` (cancel all
   goals, authoritative on the server) **plus** a one-shot `StopMove` (api id 1003)
   so the dog halts immediately.
+- **Live pose** → tails `ros2 run tf2_ros tf2_echo map base_link`.
 
 ```bash
 # UI: open http://<device>:7100  — or hit the API directly:
-curl -X POST http://<device>:7100/api/nav/walk -H 'content-type: application/json' -d '{"x": 2.0, "y": 1.0}'
+curl -X POST http://<device>:7100/api/nav/initialpose -H 'content-type: application/json' -d '{"x": 0.0, "y": 0.0, "yaw": 0.0}'
+curl -X POST http://<device>:7100/api/nav/goal -H 'content-type: application/json' -d '{"x": 3.0, "y": -1.5, "yaw": 0.0}'
 curl -X POST http://<device>:7100/api/nav/stop
-curl http://<device>:7100/api/nav/status
+curl http://<device>:7100/api/nav/status     # nav2_up, navigating, live pose
 ```
+
+> The mapless "walk N metres" stack (`nav2.launch.py`, goals relative to the dog
+> in `base_link`) is still shipped — see `REAL_WORLD_POINTING.md`.
 
 ### The `/cmd_vel → sport Move` bridge (CLI-only)
 
@@ -213,12 +217,15 @@ fidelity than a one-line rclpy forwarder would give.
 - **Sport lease / posture**: like any sport command, the dog must hold the sport
   lease and be standing on a flat, clear area. nav2 will walk it into anything the
   L1 doesn't see — supervise it.
-- **Goal frame timing**: the goal `(x, y)` is captured in `base_link` once, at send
-  time ("this point relative to where I am *now*"). `odom` drift accumulates over
-  the walk.
+- **Localization**: AMCL must be seeded with the robot's real start pose (the web
+  UI's **initial pose**, or RViz "2D Pose Estimate") — a wrong start pose sends
+  every map goal to the wrong place. Confirm `/scan` lines up with the map walls.
+- **Odometry source**: defaults to `ODOM_SOURCE=utlidar` (`/utlidar/robot_odom`,
+  `nav_msgs/Odometry`). If that topic is absent on your firmware, set
+  `ODOM_SOURCE=sportmodestate`. Either still drifts — that's what AMCL corrects.
 - **lidar mount / frame**: confirm `lidar_frame` (the cloud's real `header.frame_id`)
-  and the `base_link→lidar` static transform in `nav2.launch.py` — a wrong slice
-  makes `/scan` and the costmaps garbage. Override with `lidar_*:=…` launch args.
+  and the `base_link→lidar` static transform in `nav2_mapped.launch.py` — a wrong
+  slice makes `/scan` and the costmaps garbage. Override with `lidar_*:=…` launch args.
 
 ## Mapping / SLAM (`/go2/map`, `/go2/slam_pose`) — unverified
 
