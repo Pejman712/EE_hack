@@ -10,7 +10,7 @@ from launch.actions import (
     RegisterEventHandler
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.descriptions import ComposableNode
 from launch.conditions import IfCondition
 from launch_ros.actions import Node, SetRemap, ComposableNodeContainer
@@ -43,8 +43,14 @@ def generate_launch_description():
         name='enable_rviz', default_value=enable_rviz, description='Enable rviz launch'
     )
 
+    declare_map = DeclareLaunchArgument(
+        name='map', default_value='cafe_world_map.yaml',
+        description='Map yaml filename in gazebo_sim/maps/ for Nav2 + AMCL'
+    )
+
     ld.add_action(declare_enable_rviz)
     ld.add_action(declare_use_sim_time)
+    ld.add_action(declare_map)
 
     remappings_initial = [
         ("/tf", "tf"),
@@ -218,7 +224,7 @@ def generate_launch_description():
         )
 
         nav2_launch_file = os.path.join(pkg_path, 'launch', 'nav2', 'bringup_launch.py')
-        map_yaml_file = os.path.join(pkg_path, 'maps', 'cafe_world_map.yaml')
+        map_yaml_file = PathJoinSubstitution([pkg_path, 'maps', LaunchConfiguration('map')])
         params_file = os.path.join(pkg_path, 'config', 'nav2_params.yaml')
 
         message = f"{{header: {{frame_id: map}}, pose: {{pose: {{position: {{x: {robot['x_pose']}, y: {robot['y_pose']}, z: 0.1}}, orientation: {{x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}}, }} }}"

@@ -9,7 +9,7 @@ from launch.actions import (
     RegisterEventHandler
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch.event_handlers import OnProcessExit
 from launch_ros.actions import SetParameter
 def generate_launch_description():
@@ -24,8 +24,14 @@ def generate_launch_description():
 
     ld.add_action(SetParameter(name='use_sim_time', value=use_sim_time))
 
+    # World + map are selectable so the SAME launch runs the cafe demo OR your real
+    # SLAM map in a generated matching world (world:=real_map.world map:=real_map.yaml).
+    ld.add_action(DeclareLaunchArgument('world', default_value='cafe.world',
+                                        description='World file in gazebo_sim/world/'))
+    ld.add_action(DeclareLaunchArgument('map', default_value='cafe_world_map.yaml',
+                                        description='Map yaml in gazebo_sim/maps/ for Nav2/AMCL'))
 
-    world_file = os.path.join(pkg_path, 'world', 'cafe.world') 
+    world_file = PathJoinSubstitution([pkg_path, 'world', LaunchConfiguration('world')])
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
             get_package_share_directory('ros_gz_sim'), 'launch', 'gz_sim.launch.py')),
@@ -43,7 +49,8 @@ def generate_launch_description():
     multi_nav2_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_path, 'launch', 'gazebo_multi_nav2_world.launch.py')
-        )
+        ),
+        launch_arguments={'map': LaunchConfiguration('map')}.items()
     )
 
     launch_after_pause = RegisterEventHandler(
