@@ -122,6 +122,15 @@ api_id isn't confirmed against Unitree's docs). Watch it with:
 wendy device logs --app sitstand --follow
 ```
 
+**Built-in connectivity self-check** — runs continuously, no robot motion, no
+manual `ros2 topic` commands needed: every 5s the node logs how many real
+`/lowstate` messages it received from the robot (`0` means the DDS path to the
+robot isn't up — check network/domain before suspecting the sport commands
+themselves), and publishes+receives its own heartbeat on `/sit_stand/heartbeat`
+to confirm this node's *own* publisher is reaching the DDS bus at all,
+independent of whether the robot is reachable. Both show up in the same log
+stream above.
+
 Same WendyOS framework setup as `ros2` (`frameworks.ros2` domain `0`, `network: host`,
 loopback-only injection overridden in `sit_stand/ros_entrypoint.sh`). Params:
 `sit_seconds` (default `4.0`) and `auto_run_on_start` (default `false` — set `true`

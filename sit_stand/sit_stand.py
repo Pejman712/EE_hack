@@ -25,6 +25,13 @@ robot's reply (matched back to the Sit/RiseSit label by that id) — `code == 0`
 is success, matching the convention other unitree_sdk2py error tables use, but
 this hasn't been confirmed against Unitree's docs for every api_id, so treat a
 nonzero code as "investigate" rather than a specific known failure.
+
+Built-in connectivity self-check (no robot motion, runs continuously): every
+DIAGNOSTIC_INTERVAL_S seconds the node logs how many real `/lowstate` messages
+it received from the robot in that window (0 means the DDS path to the robot
+isn't up — check network/domain before suspecting the sport commands), and
+publishes+receives its own heartbeat on `/sit_stand/heartbeat` to confirm this
+node's publisher is actually reaching the DDS bus, independent of the robot.
 """
 import itertools
 import os
@@ -32,14 +39,20 @@ import time
 
 import rclpy
 from rclpy.node import Node
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from unitree_api.msg import Request, Response
+from unitree_go.msg import LowState
 
 SPORT_REQUEST_TOPIC = "/api/sport/request"
 SPORT_RESPONSE_TOPIC = "/api/sport/response"
 SPORT_API_ID_SIT = 1009
 SPORT_API_ID_RISESIT = 1010
 SPORT_API_LABELS = {SPORT_API_ID_SIT: "Sit", SPORT_API_ID_RISESIT: "RiseSit"}
+
+LOWSTATE_TOPIC = "/lowstate"
+HEARTBEAT_TOPIC = "/sit_stand/heartbeat"
+DIAGNOSTIC_INTERVAL_S = 5.0
 
 
 class SitStand(Node):
@@ -55,6 +68,17 @@ class SitStand(Node):
         self._sub = self.create_subscription(
             Response, SPORT_RESPONSE_TOPIC, self._on_response, 10)
         self._srv = self.create_service(Trigger, "sit_and_stand", self._on_trigger)
+
+        # Self-check: counts real robot telemetry, and round-trips a heartbeat
+        # this node publishes itself — see module docstring.
+        self._lowstate_count = 0
+        self._heartbeat_ids = itertools.count(1)
+        self._lowstate_sub = self.create_subscription(
+            LowState, LOWSTATE_TOPIC, self._on_lowstate, 10)
+        self._heartbeat_pub = self.create_publisher(String, HEARTBEAT_TOPIC, 10)
+        self._heartbeat_sub = self.create_subscription(
+            String, HEARTBEAT_TOPIC, self._on_heartbeat, 10)
+        self.create_timer(DIAGNOSTIC_INTERVAL_S, self._run_diagnostics)
 
         self.get_logger().info(
             f"sit_stand up (domain={os.environ.get('ROS_DOMAIN_ID')}, "
@@ -72,6 +96,27 @@ class SitStand(Node):
         self._auto_timer.cancel()
         self.get_logger().info("auto_run_on_start fired")
         self._sit_then_stand()
+
+    def _on_lowstate(self, msg):
+        self._lowstate_count += 1
+
+    def _on_heartbeat(self, msg):
+        self.get_logger().info(f"heartbeat round-trip ok: {msg.data}")
+
+    def _run_diagnostics(self):
+        if self._lowstate_count:
+            self.get_logger().info(
+                f"{LOWSTATE_TOPIC}: {self._lowstate_count} messages in the last "
+                f"{DIAGNOSTIC_INTERVAL_S:g}s (robot reachable)")
+        else:
+            self.get_logger().warn(
+                f"{LOWSTATE_TOPIC}: 0 messages in the last {DIAGNOSTIC_INTERVAL_S:g}s "
+                "— robot/DDS path not reachable from this node right now")
+        self._lowstate_count = 0
+
+        n = next(self._heartbeat_ids)
+        self.get_logger().info(f"publishing heartbeat #{n} on {HEARTBEAT_TOPIC}")
+        self._heartbeat_pub.publish(String(data=f"sit_stand heartbeat #{n}"))
 
     def _on_response(self, msg):
         req_id = msg.header.identity.id

@@ -3,27 +3,12 @@
   "version": "0.1.0",
   "platform": "linux",
   "services": {
-    "ros2": {
-      "context": "./ros2",
-      "frameworks": {
-        "ros2": {
-          "domainId": 0,
-          "rmw": "rmw_cyclonedds_cpp",
-          "distro": "humble"
-        }
-      },
-      "entitlements": [{ "type": "network", "mode": "host" }]
-    },
-    "sitstand": {
-      "context": "./sit_stand",
-      "frameworks": {
-        "ros2": {
-          "domainId": 0,
-          "rmw": "rmw_cyclonedds_cpp",
-          "distro": "humble"
-        }
-      },
-      "entitlements": [{ "type": "network", "mode": "host" }]
+    "recorder": {
+      "context": "./recorder",
+      "entitlements": [
+        { "type": "network", "mode": "host" },
+        { "type": "persist", "name": "rosbags", "path": "/data" }
+      ]
     }
   }
 }
