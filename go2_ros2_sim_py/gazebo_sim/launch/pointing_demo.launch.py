@@ -93,6 +93,10 @@ def generate_launch_description():
         namespace=namespace,
         output='screen',
         parameters=[{'goal_frame': goal_frame, 'arm': arm}],
+        # The sim publishes TF on /<ns>/tf, but a TransformListener defaults to the
+        # global /tf. Remap so this namespaced node reads /<ns>/tf (else it never
+        # sees map/base_link -> "map does not exist").
+        remappings=[('/tf', 'tf'), ('/tf_static', 'tf_static')],
     )
 
     # 4. Live visualization of the skeleton overlay (camera + detection + arms-up +
