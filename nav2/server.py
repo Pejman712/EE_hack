@@ -71,8 +71,14 @@ COV_XX, COV_YY, COV_YAW = 0.25, 0.25, 0.06853892326654787
 app = FastAPI(title="go2-nav2-map")
 
 # Long-lived nav2 stack + the single in-flight goal + latest robot pose.
+#   pose      : map -> base_link  (AMCL-localised pose in the map)
+#   odom      : odom -> base_link (raw utlidar dead-reckoning; tf2_echo)
+#   odom_zero : snapshot taken on "reset" — DISPLAY tare only. Subtracted from
+#               `odom` before it's shown so the readout reads (0,0,0) at reset.
+#               Purely cosmetic: the real TF / AMCL chain is never touched.
 _nav = {"launch": None, "goal": None, "x": None, "y": None, "yaw": None,
-        "started": None, "result": None, "pose": None}
+        "started": None, "result": None, "pose": None,
+        "odom": None, "odom_zero": None}
 _map = {"meta": None, "png": None, "png_mtime": None}
 
 
@@ -166,13 +172,15 @@ _TRANS_RE = re.compile(r"Translation:\s*\[\s*([-\d.eE]+),\s*([-\d.eE]+)")
 _QUAT_RE = re.compile(r"Quaternion\s*\[\s*([-\d.eE]+),\s*([-\d.eE]+),\s*([-\d.eE]+),\s*([-\d.eE]+)")
 
 
-def _pose_poller():
-    """Run tf2_echo and parse map->base_link into _nav['pose'] (~1 Hz). Restarts
-    the subprocess if it dies (e.g. TF not available until AMCL is active)."""
+def _tf_poller(parent: str, child: str, key: str):
+    """Tail `tf2_echo <parent> <child>` and keep the latest x/y/yaw in _nav[key]
+    (~1 Hz). Restarts the subprocess if it dies (e.g. TF not available until the
+    relevant node is active). Used for both map->base_link (AMCL pose) and
+    odom->base_link (raw utlidar odom)."""
     while True:
         try:
             proc = subprocess.Popen(
-                ["ros2", "run", "tf2_ros", "tf2_echo", "map", "base_link"],
+                ["ros2", "run", "tf2_ros", "tf2_echo", parent, child],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                 start_new_session=True)
         except Exception:  # noqa: BLE001
@@ -188,10 +196,26 @@ def _pose_poller():
             if q and tx is not None:
                 qz, qw = float(q.group(3)), float(q.group(4))
                 yaw = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
-                _nav["pose"] = {"x": tx, "y": ty, "yaw": yaw, "t": time.time()}
+                _nav[key] = {"x": tx, "y": ty, "yaw": yaw, "t": time.time()}
                 tx = ty = None
         proc.wait()
         time.sleep(2)  # TF dropped — wait and re-attach
+
+
+def _tared_odom():
+    """Raw odom minus the reset snapshot, expressed in the reset-pose frame so a
+    fresh reset reads (0,0,0) and +x is 'forward since reset'. None if no odom
+    yet. DISPLAY only — does not affect TF/AMCL."""
+    o = _nav["odom"]
+    if not o or time.time() - o["t"] > 5.0:
+        return None  # stale — odom stopped flowing
+    z = _nav["odom_zero"]
+    if not z:
+        return {"x": o["x"], "y": o["y"], "yaw": o["yaw"]}
+    dx, dy = o["x"] - z["x"], o["y"] - z["y"]
+    c, s = math.cos(z["yaw"]), math.sin(z["yaw"])
+    yaw = math.atan2(math.sin(o["yaw"] - z["yaw"]), math.cos(o["yaw"] - z["yaw"]))
+    return {"x": c * dx + s * dy, "y": -s * dx + c * dy, "yaw": yaw}
 
 
 # ---------------------------------------------------------------------------- API
@@ -226,7 +250,28 @@ def api_status() -> dict:
         "started": _nav["started"],
         "result": _nav["result"],
         "pose": pose,
+        "odom": _tared_odom(),
+        "odom_tared": _nav["odom_zero"] is not None,
     }
+
+
+@app.post("/api/nav/odom_reset")
+def api_odom_reset() -> dict:
+    """Zero the displayed utlidar odom at the robot's current pose (display tare).
+    Snapshots the live odom->base_link; the status endpoint subtracts it. Does
+    NOT touch the TF tree or AMCL — navigation is unaffected."""
+    o = _nav["odom"]
+    if not o or time.time() - o["t"] > 5.0:
+        raise HTTPException(503, "no live odom yet — is go2_odom publishing?")
+    _nav["odom_zero"] = {"x": o["x"], "y": o["y"], "yaw": o["yaw"]}
+    return {"ok": True}
+
+
+@app.post("/api/nav/odom_unreset")
+def api_odom_unreset() -> dict:
+    """Clear the tare — show raw odom->base_link values again."""
+    _nav["odom_zero"] = None
+    return {"ok": True}
 
 
 @app.post("/api/nav/initialpose")
@@ -318,10 +363,12 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   .seg button.on.goal{background:var(--teal);color:#0c0e12;}
   button{border:none;border-radius:10px;padding:11px 18px;font-weight:800;font-size:14px;cursor:pointer;}
   .send.init{background:var(--green);color:#0c0e12;} .send.goal{background:var(--teal);color:#0c0e12;}
+  .send.amber{background:var(--amber);color:#0c0e12;}
   .stop{background:linear-gradient(92deg,#ff6b6b,#ff9a8b);color:#0c0e12;}
   button:disabled{opacity:.45;cursor:not-allowed;}
+  .readout{font-size:18px;font-weight:800;color:var(--ink);padding:6px 0;min-width:74px;}
   h3{font-size:13px;margin:0 0 10px;letter-spacing:.04em;text-transform:uppercase;}
-  h3.init{color:var(--green);} h3.goal{color:var(--teal);}
+  h3.init{color:var(--green);} h3.goal{color:var(--teal);} h3.amber{color:var(--amber);}
   .status{margin-top:14px;font-size:13px;color:var(--muted);}
   .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#444;margin-right:7px;vertical-align:middle;}
   .dot.on{background:var(--teal);box-shadow:0 0 8px var(--teal);animation:pulse 1s infinite;}
@@ -379,6 +426,20 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
           <button class="stop" onclick="stop()">■ Stop</button>
         </div>
         <p class="hint">Sends <code>NavigateToPose</code> in the <code>map</code> frame (absolute).</p>
+      </div>
+
+      <div class="card">
+        <h3 class="amber">⟳ Odom (utlidar)</h3>
+        <div class="row" style="gap:18px;font-variant-numeric:tabular-nums">
+          <div><label>x (m)</label><div class="readout" id="ox">—</div></div>
+          <div><label>y (m)</label><div class="readout" id="oy">—</div></div>
+          <div><label>yaw (rad)</label><div class="readout" id="oyaw">—</div></div>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button class="send amber" onclick="resetOdom()">Reset to 0 here</button>
+          <button onclick="unresetOdom()" style="background:var(--line);color:var(--ink)">Show raw</button>
+        </div>
+        <p class="hint" id="ohint">Live <code>odom→base_link</code> from <code>/utlidar/robot_odom</code>.</p>
       </div>
     </div>
   </div>
@@ -465,6 +526,8 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
       if(d&&d.detail)setStatus("warn","error: "+d.detail);}
     finally{setTimeout(()=>{btn.disabled=false;refresh();},400);}}
   async function stop(){await j("/api/nav/stop","POST");setTimeout(refresh,300);}
+  async function resetOdom(){await j("/api/nav/odom_reset","POST");refresh();}
+  async function unresetOdom(){await j("/api/nav/odom_unreset","POST");refresh();}
 
   function setStatus(cls,txt){
     document.getElementById("status").innerHTML=
@@ -473,6 +536,13 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   async function refresh(){
     const s=await j("/api/nav/status");
     robot=s.pose?{x:s.pose.x,y:s.pose.y,yaw:s.pose.yaw}:null;redraw();
+    const o=s.odom;
+    document.getElementById("ox").textContent  =o?o.x.toFixed(2):"—";
+    document.getElementById("oy").textContent  =o?o.y.toFixed(2):"—";
+    document.getElementById("oyaw").textContent=o?o.yaw.toFixed(3):"—";
+    document.getElementById("ohint").innerHTML=s.odom_tared
+      ?"Tared — showing displacement since reset (display only; TF/AMCL untouched)."
+      :"Live <code>odom→base_link</code> from <code>/utlidar/robot_odom</code>.";
     if(!s.nav2_up){setStatus("warn","nav2 starting up…");return;}
     let m=robot?"":"  (no robot pose yet — set an initial pose)";
     if(s.navigating)setStatus("on","navigating → ("+s.goal.x.toFixed(2)+", "+s.goal.y.toFixed(2)+") m"+m);
@@ -501,7 +571,10 @@ def _bootstrap():
     # the map-based nav2 stack and start tailing the robot pose.
     time.sleep(4)
     _start_nav2()
-    threading.Thread(target=_pose_poller, daemon=True).start()
+    threading.Thread(target=_tf_poller, args=("map", "base_link", "pose"),
+                     daemon=True).start()
+    threading.Thread(target=_tf_poller, args=("odom", "base_link", "odom"),
+                     daemon=True).start()
 
 
 if __name__ == "__main__":
