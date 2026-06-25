@@ -329,14 +329,14 @@ class PoseNode(Node):
             if (not self._gate_triggered
                     and now - self._arms_up_since >= ARMS_UP_HOLD_S):
                 self._gate_triggered = True
-                self._active = not self._active
-                if self._active:
-                    self._filter_epoch_start = now
-                    self._filter_left_buf.clear()
-                    self._filter_right_buf.clear()
-                else:
-                    self._filter_left_avg  = None
-                    self._filter_right_avg = None
+                # Each arms-up starts a FRESH capture (no toggle-off) so the flow is
+                # always "raise -> point -> go"; raise again for the next point.
+                self._active = True
+                self._filter_epoch_start = now
+                self._filter_left_buf.clear()
+                self._filter_right_buf.clear()
+                self._filter_left_avg  = None
+                self._filter_right_avg = None
         else:
             self._arms_up_since  = None
             self._gate_triggered = False

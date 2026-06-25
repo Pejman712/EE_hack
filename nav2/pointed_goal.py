@@ -89,12 +89,17 @@ class PointedGoal(Node):
         self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
 
         self.create_subscription(PoseArray, gp("input_topic").value, self._on_points, 10)
-        self._last_goal = None
-        self._last_sent = None
+
+        # One-shot gate: send exactly ONE goal per arms-up. The rising edge of the
+        # 99-sentinel (arms up) re-arms; the first valid point after that is sent,
+        # then further points are ignored until the next arms-up.
+        self._in_sentinel = False
+        self._armed = False
+        self._sent_this_cycle = False
 
         self.get_logger().info(
-            f"pointed_goal: {gp('input_topic').value} -> navigate_to_pose "
-            f"(arm={self.arm}, base={self.base_frame} -> {self.goal_frame})")
+            f"pointed_goal ready ({self.base_frame} -> {self.goal_frame}). "
+            "Raise both arms (~3 s) to choose a point.")
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -120,14 +125,26 @@ class PointedGoal(Node):
         return None
 
     def _on_points(self, msg: PoseArray):
-        pose = self._pick(msg.poses)
-        if pose is None:
-            return  # NaN / sentinel / not pointing
+        poses = msg.poses
 
-        now = self.get_clock().now()
-        if self._last_sent is not None:
-            if (now - self._last_sent).nanoseconds / 1e9 < self.min_goal_interval:
-                return
+        # Arms-up (99 sentinel): the RISING edge re-arms for exactly one goal.
+        if any(self._is_sentinel(p) for p in poses):
+            if not self._in_sentinel:
+                self._in_sentinel = True
+                self._armed = True
+                self._sent_this_cycle = False
+                self.get_logger().info(
+                    "🙌 Arms up detected — WAITING for you to point at a spot...")
+            return
+        self._in_sentinel = False
+
+        # Only act when armed and not already fired this cycle.
+        if not self._armed or self._sent_this_cycle:
+            return
+
+        pose = self._pick(poses)
+        if pose is None:
+            return  # armed, but no valid pointing hit yet — keep waiting
 
         # camera-optical (x right, y down, z fwd) -> base_link (x fwd, y left, z up)
         bx = pose.position.z + self.cam_fwd
@@ -138,6 +155,7 @@ class PointedGoal(Node):
         pt.header.stamp = rclpy.time.Time().to_msg()
         pt.point.x, pt.point.y, pt.point.z = bx, by, 0.0
 
+        # base_link -> goal_frame: this adds the robot's current odom pose + heading.
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.goal_frame, self.base_frame,
@@ -149,28 +167,28 @@ class PointedGoal(Node):
         g = do_transform_point(pt, tf)
         gx, gy = g.point.x, g.point.y
 
-        if self._last_goal is not None and \
-                math.hypot(gx - self._last_goal[0], gy - self._last_goal[1]) < self.min_goal_delta:
+        if not self.nav_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().warn("navigate_to_pose action server not available yet")
             return
 
         yaw = math.atan2(gy - tf.transform.translation.y, gx - tf.transform.translation.x)
         goal_pose = PoseStamped()
         goal_pose.header.frame_id = self.goal_frame
-        goal_pose.header.stamp = now.to_msg()
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
         goal_pose.pose.position.x = gx
         goal_pose.pose.position.y = gy
         goal_pose.pose.orientation = yaw_to_quat(yaw)
 
-        if not self.nav_client.wait_for_server(timeout_sec=1.0):
-            self.get_logger().warn("navigate_to_pose action server not available yet")
-            return
-
         goal = NavigateToPose.Goal()
         goal.pose = goal_pose
         self.nav_client.send_goal_async(goal)
-        self._last_goal = (gx, gy)
-        self._last_sent = now
-        self.get_logger().info(f"Sent Nav2 goal in {self.goal_frame}: x={gx:.2f} y={gy:.2f}")
+
+        # One-shot: stop until the next arms-up.
+        self._armed = False
+        self._sent_this_cycle = True
+        self.get_logger().info(
+            f"✅ Goal sent ({self.goal_frame} x={gx:.2f} y={gy:.2f}). "
+            "Raise both arms again to choose a new point.")
 
 
 def main(args=None):
