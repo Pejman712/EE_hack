@@ -32,6 +32,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -61,7 +62,10 @@ def generate_launch_description():
                               description='map (sim) | odom (mapless)'),
         DeclareLaunchArgument('arm', default_value='either',
                               description='which arm to follow: right|left|either'),
+        DeclareLaunchArgument('viz', default_value='true',
+                              description='Open a live view of the skeleton overlay'),
     ]
+    viz = LaunchConfiguration('viz')
 
     # 1. webcam -> /<ns>/color/image_raw  (reuses webcam.launch.py)
     webcam = IncludeLaunchDescription(
@@ -85,4 +89,15 @@ def generate_launch_description():
         parameters=[{'goal_frame': goal_frame, 'arm': arm}],
     )
 
-    return LaunchDescription(args + [webcam, pose, bridge])
+    # 4. Live visualization of the skeleton overlay (camera + detection + arms-up +
+    #    pointing all visible in one window). Confirms the whole input side at a glance.
+    viewer = Node(
+        package='rqt_image_view',
+        executable='rqt_image_view',
+        name='pointing_viewer',
+        arguments=['/annotated_image'],
+        condition=IfCondition(viz),
+        output='screen',
+    )
+
+    return LaunchDescription(args + [webcam, pose, bridge, viewer])
