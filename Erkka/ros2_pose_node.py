@@ -87,7 +87,7 @@ L_WRIST, R_WRIST = 15, 16
 FOOT_IDX = (27, 28, 29, 30, 31, 32)  # ankles, heels, foot index
 
 ARMS_UP_HOLD_S  = 3.0  # both wrists must be above shoulders for this long to activate
-FILTER_WINDOW_S = 3.0  # epoch length for the pointing-location average
+FILTER_WINDOW_S = 1.5  # how long to average the pointing location before publishing it
 
 
 def focal_px(width):
@@ -259,6 +259,7 @@ class PoseNode(Node):
 
         # 3-second epoch filter for pointed location
         self._filter_epoch_start = 0.0
+        self._epoch_pending = False   # start the averaging window when pointing begins
         self._filter_left_buf:  list = []
         self._filter_right_buf: list = []
         self._filter_left_avg:  np.ndarray | None = None
@@ -332,7 +333,7 @@ class PoseNode(Node):
                 # Each arms-up starts a FRESH capture (no toggle-off) so the flow is
                 # always "raise -> point -> go"; raise again for the next point.
                 self._active = True
-                self._filter_epoch_start = now
+                self._epoch_pending = True   # window starts when arms come back down
                 self._filter_left_buf.clear()
                 self._filter_right_buf.clear()
                 self._filter_left_avg  = None
@@ -352,7 +353,16 @@ class PoseNode(Node):
             pa.poses = [sentinel, sentinel]
 
         elif self._active:
-            # Pointing active — collect hits and publish 3-second epoch averages
+            # Pointing active — collect hits and publish the averaged location.
+            # Start the window the moment pointing begins (arms lowered), so each
+            # raise gives a clean, repeatable capture regardless of how long the
+            # arms-up hold was.
+            if self._epoch_pending:
+                self._filter_epoch_start = now
+                self._filter_left_buf.clear()
+                self._filter_right_buf.clear()
+                self._epoch_pending = False
+
             if left_hit  is not None:
                 self._filter_left_buf.append(left_hit)
             if right_hit is not None:
