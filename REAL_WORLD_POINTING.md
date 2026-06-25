@@ -1,5 +1,38 @@
 # Pointing → Nav2 on the real Go2 (Humble)
 
+## ⭐ Quick start — map-based navigation, no camera
+
+Localize in your saved map and drive to a point you choose. **No camera / pointing.**
+
+```bash
+# Terminal 1 — the WHOLE stack:
+#   odom + scan + map_server + AMCL + Nav2 + cmd_vel→sport bridge
+source /opt/ros/humble/setup.bash
+source ~/unitree_ros2/install/setup.bash
+cd EE_hack/nav2
+ros2 launch nav2_mapped.launch.py
+```
+This brings up everything for map-based navigation (no camera/pointing): loads
+`nav2/maps/map.yaml`, AMCL localizes (`map→odom`), the Nav2 servers run, and the
+`cmd_vel→sport` bridge drives the dog.
+
+```bash
+# Terminal 2 — go to a chosen point (ABSOLUTE map coordinates)
+cd EE_hack/nav2
+python3 goto_point.py --ros-args -p frame:=map -p x:=3.0 -p y:=-1.5
+```
+
+**Before the first goal:** AMCL starts at the map origin. If the robot isn't
+physically there, set its real start pose once (Foxglove pose tool, or publish to
+`/initialpose`) — otherwise goals go to the wrong place. Confirm the laser lines up
+with the map walls, then send goals.
+
+> The rest of this doc covers the **camera pointing** mode (point at the ground →
+> the dog goes there) and full debugging. For just "localize + drive to a point,"
+> the two commands above are all you need.
+
+---
+
 Point at the ground; the dog walks there. This wires the MediaPipe pose node
 (`ros2_pose_node.py`) into the existing **mapless Nav2** stack (`nav2/`) via a small
 bridge (`nav2/pointed_goal.py`).
