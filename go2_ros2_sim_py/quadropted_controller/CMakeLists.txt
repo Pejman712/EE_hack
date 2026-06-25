@@ -19,6 +19,7 @@ install(PROGRAMS
   scripts/cmd_vel_pub.py
   scripts/cmd_vel_to_sport.py
   scripts/pointed_goal.py
+  scripts/goto_point.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

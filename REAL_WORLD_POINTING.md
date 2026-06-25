@@ -144,6 +144,51 @@ ros2 topic echo /api/sport/request --once       # cmd_vel_to_sport forwarding Mo
 
 ---
 
+---
+
+## Go to a chosen X,Y point (`goto_point.py`)
+
+Manual alternative to pointing — pick a coordinate and the dog drives there. Same
+Nav2 interface, sends one goal and reports progress.
+
+```bash
+# mapless stack (frame=odom, relative to where the robot started):
+cd EE_hack/nav2
+python3 goto_point.py --ros-args -p frame:=odom -p x:=2.0 -p y:=0.0 -p yaw:=0.0
+```
+
+## Navigating by ABSOLUTE map coordinates (map-based mode)
+
+`nav2.launch.py` is mapless (goals relative to start). To use your saved map and
+send goals in **absolute map coordinates**, use the map-based stack — it adds
+`map_server` (loads `nav2/maps/map.yaml`) + `amcl` (localizes, publishes `map->odom`):
+
+```bash
+# 1. map-based nav2 (instead of nav2.launch.py)
+cd EE_hack/nav2
+ros2 launch nav2_mapped.launch.py            # or map:=/path/to/other_map.yaml
+
+# 2. localize: amcl starts at the map origin. If the robot isn't there, set its
+#    real pose in RViz (2D Pose Estimate) or edit initial_pose in
+#    config/nav2_params_mapped.yaml.
+
+# 3. drive to an absolute point in the map:
+python3 goto_point.py --ros-args -p frame:=map -p x:=3.0 -p y:=-1.5
+#    ...or point at the ground with the camera:
+python3 pointed_goal.py --ros-args -p goal_frame:=map
+```
+
+Debug map mode (in addition to the chain above):
+```bash
+ros2 topic echo /map --once --qos-durability transient_local   # map served?
+ros2 run tf2_tools view_frames                                  # need map->odom (amcl) and odom->base_link
+ros2 lifecycle get /amcl                                        # 'active'?
+```
+If the laser doesn't line up with the map walls in RViz, fix the initial pose
+(2D Pose Estimate) — a wrong start pose makes every goal go to the wrong place.
+
+---
+
 ## Notes
 - `nav2/pointed_goal.py` is byte-identical to the sim copy in
   `go2_ros2_sim_py/quadropted_controller/scripts/pointed_goal.py` — same logic, only
