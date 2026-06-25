@@ -3,18 +3,12 @@
   "version": "0.1.0",
   "platform": "linux",
   "services": {
-    "bridge": {
-      "context": "./bridge",
-      "entitlements": [{ "type": "network", "mode": "host" }]
-    },
-    "camera": {
-      "context": "./camera",
-      "dependsOn": ["bridge"],
-      "entitlements": [{ "type": "network", "mode": "host" }]
-    },
-    "control": {
-      "context": "./control",
-      "entitlements": [{ "type": "network", "mode": "host" }]
+    "recorder": {
+      "context": "./recorder",
+      "entitlements": [
+        { "type": "network", "mode": "host" },
+        { "type": "persist", "name": "rosbags", "path": "/data" }
+      ]
     }
   }
 }
