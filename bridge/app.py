@@ -16,6 +16,13 @@ Channels:
   /go2/state      json                      ← rt/lowstate + rt/sportmodestate (plots)
   /go2/uwb        json                      ← rt/uwbstate (range / seen / yaw)
 
+The forwarded camera frames are ALSO republished on a real DDS topic
+(rt/go2/camera/compressed, CAMERA_DDS_TOPIC) as sensor_msgs/CompressedImage — so
+on the same DDS domain they show up as the ROS 2 topic /go2/camera/compressed
+for `ros2 topic echo`, image_transport, nav2 and slam, exactly like the LiDAR
+and pose topics. This is the same direct-cyclonedds + hand-written IDL trick the
+PointCloud2/PoseStamped readers use, just as a writer (see compressedimage.py).
+
 /go2/map and /go2/slam_pose are UNVERIFIED — they read topics the Go2's onboard
 uslam stack publishes continuously during normal operation (no need to trigger
 anything), but the topic names/QoS and the frame /go2/slam_pose's poses are
@@ -45,8 +52,10 @@ import foxglove
 import uvicorn
 from cyclonedds.core import Policy, Qos
 from cyclonedds.domain import DomainParticipant
+from cyclonedds.pub import DataWriter, Publisher
 from cyclonedds.sub import DataReader, Subscriber
 from cyclonedds.topic import Topic
+from cyclonedds.util import duration
 from fastapi import FastAPI, Request, Response
 from foxglove.channels import (
     CompressedImageChannel,
@@ -66,7 +75,8 @@ from foxglove.schemas import (
     Timestamp,
     Vector3,
 )
-from pointcloud2 import PointCloud2_  # local IDL (sensor_msgs/PointCloud2)
+from compressedimage import CompressedImage_  # local IDL (sensor_msgs/CompressedImage)
+from pointcloud2 import PointCloud2_, _Header, _Time  # local IDL (sensor_msgs/PointCloud2)
 from posestamped import PoseStamped_  # local IDL (geometry_msgs/PoseStamped)
 
 logging.basicConfig(level=logging.INFO)
@@ -77,6 +87,10 @@ INGEST_PORT = int(os.environ.get("INGEST_PORT", "8766"))
 LIDAR_TOPIC = os.environ.get("LIDAR_TOPIC", "rt/utlidar/cloud_deskewed")
 MAP_TOPIC = os.environ.get("MAP_TOPIC", "rt/uslam/cloud_map")
 SLAM_POSE_TOPIC = os.environ.get("SLAM_POSE_TOPIC", "rt/utlidar/robot_pose")
+# DDS topic the forwarded JPEGs are republished on as sensor_msgs/CompressedImage.
+# ROS 2 maps `/go2/camera/compressed` <-> the DDS name `rt/go2/camera/compressed`.
+CAMERA_DDS_TOPIC = os.environ.get("CAMERA_DDS_TOPIC", "rt/go2/camera/compressed")
+CAMERA_FRAME_ID = os.environ.get("CAMERA_FRAME_ID", "camera")
 DDS_DOMAIN = int(os.environ.get("DDS_DOMAIN", "0"))
 
 # ── Foxglove server + channels ──────────────────────────────────────────────
@@ -107,6 +121,7 @@ _ROS_TO_FOX = {
 }
 
 _state = {}  # merged latest lowstate + sportmodestate fields for the plots
+_camera_writer = None  # DDS DataWriter for sensor_msgs/CompressedImage (set in main)
 
 # Diagnostics, exposed at GET /diag on the ingest port — container logs are
 # unreliable here, so this is how we see what's actually flowing.
@@ -141,6 +156,18 @@ def _now():
     return Timestamp(sec=int(t), nsec=int((t % 1) * 1e9))
 
 
+def _camera_msg(jpg: bytes):
+    t = time.time()
+    return CompressedImage_(
+        header=_Header(
+            stamp=_Time(sec=int(t), nanosec=int((t % 1) * 1e9)),
+            frame_id=CAMERA_FRAME_ID,
+        ),
+        format="jpeg",
+        data=jpg,
+    )
+
+
 def _safe(fn):
     try:
         fn()
@@ -156,13 +183,21 @@ api = FastAPI(title="go2-foxglove-ingest")
 async def frame(request: Request):
     jpg = await request.body()
     if jpg:
+        # (1) Foxglove channel — shows up in the single Foxglove connection.
         _safe(
             lambda: camera_ch.log(
                 CompressedImage(
-                    timestamp=_now(), frame_id="camera", format="jpeg", data=jpg
+                    timestamp=_now(),
+                    frame_id=CAMERA_FRAME_ID,
+                    format="jpeg",
+                    data=jpg,
                 )
             )
         )
+        # (2) Real DDS topic — surfaces as the ROS 2 topic /go2/camera/compressed
+        #     (sensor_msgs/CompressedImage) for nav2/slam/ros2 CLI on this domain.
+        if _camera_writer is not None:
+            _safe(lambda: _camera_writer.write(_camera_msg(jpg)))
         _bump("camera")
     return Response(status_code=204)
 
@@ -366,10 +401,30 @@ def _start_unitree_subs():
     print("DIAG", _diag["unitree_init"], flush=True)
 
 
+def _start_camera_writer():
+    # Publish forwarded JPEGs on a real DDS topic so they appear as the ROS 2
+    # topic /go2/camera/compressed (sensor_msgs/CompressedImage). RELIABLE +
+    # KeepLast(5) matches the default ROS 2 subscriber QoS, so `ros2 topic echo`
+    # / image_transport / nav2 / slam connect without any --qos overrides.
+    global _camera_writer
+    try:
+        qos = Qos(
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.History.KeepLast(5),
+        )
+        dp = DomainParticipant(DDS_DOMAIN)
+        topic = Topic(dp, CAMERA_DDS_TOPIC, CompressedImage_, qos=qos)
+        _camera_writer = DataWriter(Publisher(dp), topic, qos=qos)
+        print(f"DIAG camera DDS writer up on {CAMERA_DDS_TOPIC}", flush=True)
+    except Exception as e:  # noqa: BLE001 — degrade to Foxglove-only on failure
+        _err("camera_writer_setup", e)
+
+
 def main():
     # Init the SDK factory FIRST, then the direct-cyclonedds LiDAR participant —
     # in case the dual DDS stack is order-sensitive in one process.
     _start_unitree_subs()
+    _start_camera_writer()
     threading.Thread(
         target=_pointcloud_loop,
         name="lidar",
