@@ -13,6 +13,7 @@ Exposes a tiny web UI + JSON API on PORT (default 7000, host networking).
   POST /api/record/stop      SIGINT the recorder so it finalizes cleanly
   POST /api/go2/sit          publish a Go2 sport Sit request
   POST /api/go2/stand        publish a Go2 sport RiseSit request
+  POST /api/go2/recover      publish a Go2 sport RecoveryStand (get up off the ground)
   POST /api/go2/move/DIR     publish a Go2 sport Move request
   POST /api/go2/stop         publish a Go2 sport StopMove request
   GET  /download?bag=NAME&fmt=mcap|tar
@@ -34,9 +35,10 @@ AUTO_RECORD = os.environ.get("AUTO_RECORD", "0") == "1"
 SPORT_REQUEST_TOPIC = "/api/sport/request"
 SPORT_REQUEST_TYPE = "unitree_api/msg/Request"
 SPORT_API_ID_STOP = 1003
+SPORT_API_ID_RECOVERY = 1006  # RecoveryStand — get up from lying/fallen on the ground
 SPORT_API_ID_MOVE = 1008
 SPORT_API_ID_SIT = 1009
-SPORT_API_ID_STAND = 1010
+SPORT_API_ID_STAND = 1010  # RiseSit — rise from a Sit (NOT a recovery from the ground)
 MOVE_SPEED_MPS = 0.25
 MOVE_DIRECTIONS = {
     "forward": {"x": MOVE_SPEED_MPS, "y": 0.0, "z": 0.0},
@@ -144,6 +146,14 @@ def api_go2_stand() -> dict:
     return _publish_sport_request(SPORT_API_ID_STAND)
 
 
+@app.post("/api/go2/recover")
+def api_go2_recover() -> dict:
+    # RecoveryStand: bring the robot back onto its feet from lying/fallen on the
+    # ground (e.g. after a Damp or a tip-over). Unlike `stand` (RiseSit), this
+    # works from a sprawled/lying posture, not just from a Sit.
+    return _publish_sport_request(SPORT_API_ID_RECOVERY)
+
+
 @app.post("/api/go2/move/{direction}")
 def api_go2_move(direction: str) -> dict:
     params = MOVE_DIRECTIONS.get(direction)
@@ -244,6 +254,7 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   .rec{background:linear-gradient(92deg,#ff6b6b,#ff9a8b);color:#0c0e12;}
   .stop{background:linear-gradient(92deg,var(--teal),#7af0e0);color:#0c0e12;}
   .sit{background:#ffb429;color:#0c0e12;}
+  .recover{background:linear-gradient(92deg,#2dd4bf,#7af0e0);color:#0c0e12;}
   .move{background:#e7ebf0;color:#0c0e12;min-width:92px;}
   .move.stopmove{background:#ff6b6b;color:#0c0e12;}
   .drive{display:grid;grid-template-columns:repeat(3,92px);gap:8px;align-items:center;margin:0 0 18px;}
@@ -275,6 +286,7 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     <button class="stop" id="stopBtn" onclick="stop()" disabled>■ Stop &amp; save</button>
     <button class="sit" id="sitBtn" onclick="sit()">Sit down</button>
     <button class="sit" id="standBtn" onclick="stand()">Stand up</button>
+    <button class="recover" id="recoverBtn" onclick="recover()">↑ Recover (get up)</button>
     <span class="pill" id="status"><span class="dot" id="dot"></span>idle</span>
   </div>
 
@@ -336,6 +348,12 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     btn.disabled=true;
     try{await j("/api/go2/stand","POST");}
     finally{setTimeout(()=>{btn.disabled=false;},1200);}
+  }
+  async function recover(){
+    const btn=document.getElementById("recoverBtn");
+    btn.disabled=true;
+    try{await j("/api/go2/recover","POST");}
+    finally{setTimeout(()=>{btn.disabled=false;},1500);}
   }
   async function pulseButton(id, fn){
     const btn=document.getElementById(id);

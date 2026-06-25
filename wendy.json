@@ -9,6 +9,15 @@
         { "type": "network", "mode": "host" },
         { "type": "persist", "name": "rosbags", "path": "/data" }
       ]
+    },
+    "nav2": {
+      "context": "./nav2",
+      "frameworks": {
+        "ros2": { "domainId": 0, "rmw": "rmw_cyclonedds_cpp", "distro": "humble" }
+      },
+      "entitlements": [
+        { "type": "network", "mode": "host" }
+      ]
     }
   }
 }

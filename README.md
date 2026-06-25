@@ -15,14 +15,19 @@ Go2 controller ──DDS──┐
                        ├──▶│ ros2 (unitree_ros2 ⇄ DDS)      │◀─▶ /api/sport/request
                        │   │   /lowstate /sportmodestate    │
                        │   └──────────────────────────────┘
-        front cam ──WebRTC─▶│ camera ──localhost JPEG──▶ /go2/camera
+        front cam ──WebRTC─▶│ camera ──localhost JPEG──▶ /go2/camera (Foxglove)
+                           │                          └▶ rt/go2/camera/compressed (DDS)
                            └──────────────────────────────┘
 ```
 
 **Independent containers, one robot LAN.** The `camera` service does the heavy
-WebRTC decode in isolation and forwards JPEG frames to the `bridge` over localhost,
-so the camera appears on the *same* Foxglove connection — but if WebRTC fails, the
-3D/LiDAR view stays up. The `ros2` service is a separate DDS participant that
+WebRTC decode in isolation and forwards JPEG frames to the `bridge` over localhost.
+The bridge republishes each frame two ways: on the `/go2/camera` Foxglove channel
+(so the camera appears on the *same* Foxglove connection) **and** on a real DDS
+topic `rt/go2/camera/compressed` as `sensor_msgs/CompressedImage` — which surfaces
+as the ROS 2 topic **`/go2/camera/compressed`** for `ros2 topic echo`,
+image_transport, nav2 and slam, just like the LiDAR/pose topics. If WebRTC fails,
+the 3D/LiDAR view stays up. The `ros2` service is a separate DDS participant that
 exposes the Go2 to the ROS 2 ecosystem; the `bridge` keeps its own direct read
 path to Foxglove, so the two don't depend on each other.
 
@@ -139,6 +144,81 @@ to run the routine once a couple seconds after launch instead of on a service ca
 Preconditions (same as any sport command): the robot must hold the sport lease and
 be in normal sport mode (not AI/advanced mode, not damped), standing on a flat,
 clear area before you trigger it. `Sit` from another posture may no-op.
+
+## nav2 (`walk to (x, y)` from a web UI) — mapless
+
+The `nav2` service drives the Go2 with the full **nav2** stack and exposes a tiny
+web UI with two boxes — **x** (forward) and **y** (left): type a point, press
+**Walk**, and the dog plans and walks to it — steering around whatever the bottom
+**L1** sees. **Mapless on purpose:** no SLAM, no saved map, no AMCL. Both nav2
+costmaps are rolling windows in the `odom` frame, and the goal is sent as a
+`NavigateToPose` at `(x, y)` in the **`base_link`** frame, facing the target
+(yaw = `atan2(y, x)`), so it's always relative to wherever the robot is at that
+moment. `(x, 0)` is the old "walk x metres". `odom` drifts, but for short relative
+walks that's fine. (To navigate on a persistent map instead, run the `slam/` stack
+and switch the costmaps' `global_frame` to `map`.)
+
+```
+                          ┌──────────────── nav2.launch.py ────────────────┐
+/sportmodestate ─ go2_odom ─▶ TF odom→base_link + /odom ─┐                  │
+/utlidar/cloud_deskewed ─ pointcloud_to_laserscan ─▶ /scan ─┤              │
+                                                            ▼              │
+                              nav2 (controller/planner/behaviors/bt) ─▶ /cmd_vel
+                                                                          │  │
+   server.py ── ros2 action send_goal /navigate_to_pose ────────────────▶│  │
+   (FastAPI, :7100)                                                          ▼
+                              cmd_vel_to_sport.py ── /cmd_vel → /api/sport/request Move
+                          └──────────────────────────────────────────────────┘
+```
+
+**Everything is driven over the `ros2` CLI** — the same subprocess pattern
+`recorder/server.py` uses. `server.py` (FastAPI on `:7100`) launches
+`nav2.launch.py` as a subprocess, then:
+
+- **Walk** → `ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose`
+  with the goal pose at `(x, y)` in `base_link` (range clamped to 10 m).
+- **Stop** → `ros2 service call /navigate_to_pose/_action/cancel_goal` (cancel all
+  goals, authoritative on the server) **plus** a one-shot `StopMove` (api id 1003)
+  so the dog halts immediately.
+
+```bash
+# UI: open http://<device>:7100  — or hit the API directly:
+curl -X POST http://<device>:7100/api/nav/walk -H 'content-type: application/json' -d '{"x": 2.0, "y": 1.0}'
+curl -X POST http://<device>:7100/api/nav/stop
+curl http://<device>:7100/api/nav/status
+```
+
+### The `/cmd_vel → sport Move` bridge (CLI-only)
+
+The Go2 has **no `/cmd_vel` input** — it walks via sport `Move` requests
+(`unitree_api/msg/Request`, api id 1008, parameter `{"x":vx,"y":vy,"z":yaw}`) on
+`/api/sport/request`, with a velocity watchdog (~0.4 s) that stops the dog if the
+commands stop. nav2's controller, though, publishes `geometry_msgs/Twist` on
+`/cmd_vel`. `cmd_vel_to_sport.py` bridges the two with **only the ros2 CLI** (no
+rclpy): a long-lived `ros2 topic echo /cmd_vel --csv` reader and a long-lived
+`ros2 topic pub -r 10 …` writer. Since a running `ros2 topic pub` sends a *fixed*
+message, the bridge **quantizes** the command and only respawns the writer when
+the quantized command changes — during a straight walk it's near-constant, so the
+10 Hz writer keeps the watchdog fed and respawns are rare. On stop/stale `/cmd_vel`
+it publishes `StopMove`; on exit it `StopMove`s so a dying bridge never leaves the
+dog walking. This CLI-only design is deliberate; the cost is coarser velocity
+fidelity than a one-line rclpy forwarder would give.
+
+### Caveats (L1-only, unverified on a live EDU+)
+
+- **L1 coverage**: the bottom L1 is a forward/down-biased dome, **not a 360° puck**
+  — obstacle avoidance behind/beside the robot is poor. Tune the height band in
+  `config/pointcloud_to_laserscan.yaml` (shared with `slam/`) so `/scan` cuts walls,
+  not the floor; watch `/scan` against the live cloud in Foxglove first.
+- **Sport lease / posture**: like any sport command, the dog must hold the sport
+  lease and be standing on a flat, clear area. nav2 will walk it into anything the
+  L1 doesn't see — supervise it.
+- **Goal frame timing**: the goal `(x, y)` is captured in `base_link` once, at send
+  time ("this point relative to where I am *now*"). `odom` drift accumulates over
+  the walk.
+- **lidar mount / frame**: confirm `lidar_frame` (the cloud's real `header.frame_id`)
+  and the `base_link→lidar` static transform in `nav2.launch.py` — a wrong slice
+  makes `/scan` and the costmaps garbage. Override with `lidar_*:=…` launch args.
 
 ## Mapping / SLAM (`/go2/map`, `/go2/slam_pose`) — unverified
 
