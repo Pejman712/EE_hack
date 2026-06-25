@@ -144,17 +144,9 @@ def generate_launch_description():
                 arguments=['--ros-args', '--log-level', log_level],
                 parameters=[{'use_sim_time': use_sim_time},
                             {'autostart': autostart},
-                            {'node_names': ['amcl']}]),
-             Node(
-                condition=IfCondition(map_server),
-                package='nav2_lifecycle_manager',
-                executable='lifecycle_manager',
-                name='lifecycle_manager_map_server',
-                output='screen',
-                arguments=['--ros-args', '--log-level', log_level],
-                parameters=[{'use_sim_time': use_sim_time},
-                            {'autostart': autostart},
-                            {'node_names': ['map_server']}])
+                            # Activate map_server BEFORE amcl so the map exists
+                            # by the time amcl needs it (single ordered manager).
+                            {'node_names': ['map_server', 'amcl']}])
         ]
     )
 

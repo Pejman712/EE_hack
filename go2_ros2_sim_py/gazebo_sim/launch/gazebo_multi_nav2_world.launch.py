@@ -139,8 +139,8 @@ def generate_launch_description():
                 f'/{namespace}/scan@sensor_msgs/msg/LaserScan@gz.msgs.LaserScan',
                 f'/{namespace}/tf@tf2_msgs/msg/TFMessage@gz.msgs.Pose_V',
                 f'/{namespace}/joint_states@sensor_msgs/msg/JointState@gz.msgs.Model',
-                # --- Gazebo camera disabled: a real webcam publishes these topics
-                #     instead (see webcam.launch.py). Re-enable to use the sim camera.
+                # --- Gazebo camera disabled: the Logitech webcam publishes the camera
+                #     topics instead (see webcam.launch.py). Re-enable for the sim camera.
                 # f'/{namespace}/color/camera_info@sensor_msgs/msg/CameraInfo@gz.msgs.CameraInfo',
                 # f'/{namespace}/color/image_raw@sensor_msgs/msg/Image@gz.msgs.Image',
                 # f'/{namespace}/color/image_rect@sensor_msgs/msg/Image@gz.msgs.Image',

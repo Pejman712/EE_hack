@@ -1,94 +1,199 @@
-# Go2 — running on the real robot
+# Unitree go2, go1 simulation in Gazebo Sim
 
-Bringing up Nav2 + the `cmd_vel`→Unitree sport-API bridge on a **physical Unitree Go2**
-(ROS 2 Jazzy). For the sim↔real topic mapping see [SIM_TO_REAL.md](SIM_TO_REAL.md).
+This repository allows you to run dog robots in the GAZEBO simulator. The robot can walk, rotate with 12 degrees of freedom, and features a `robot_msgs` interface. The robot moves using inverse kinematics, and its odometry is based on direct kinematics. Additionally, all functionalities are developed in Python.
 
-> **Status:** this real-robot path **builds and launches but has NOT been validated on
-> hardware**. Expect to confirm topics/frames and debug the bridge. See
-> "Things that may need fixing" below.
+
+## Run from docker 
+
+> **Note:** BUILDED AND TESTED WITH NVIDIA GPU.
+
+### setup docker, docker compose and nvidia container toolkit
+[docker install](https://docs.docker.com/engine/install/ubuntu/)
+
+[nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+### build docker :
+
+```bash
+mkdir -p ~/go_sim/src
+cd ~/go_sim/src/docker
+docker compose -f compose.yml build simulator
+xhost +local:docker
+docker compose -f compose.yml up simulator
+```
+
+
+## Run from source
+
+> **Note:** BUILDED AND TESTED FROM ROS2 JAZZY, UBUNTU 22.04.
+
+> **Note:** Before launching, ensure that you install all dependencies and build the project using `colcon build`.
 
 ---
 
-## Prerequisites
+## Setup and Installation
 
-- Official Unitree ROS2 SDK installed and sourced (provides `unitree_api` /
-  `unitree_go` messages): <https://github.com/unitreerobotics/unitree_ros2>
-- This package built in a colcon workspace and sourced:
-  ```bash
-  cd ~/colcon_ws && colcon build --symlink-install
-  source install/local_setup.bash
-  source ~/unitree_ros2/install/setup.bash      # the Unitree SDK
-  ```
-- The robot publishing `/scan` (sensor_msgs/LaserScan), `/odom` (nav_msgs/Odometry),
-  and `/tf` with frames `base_link` / `odom` / `map`.
-- The Go2 standing / in `BalanceStand` (its own sport mode) before sending commands.
-
----
-
-## 1. Map your environment (one-time per space)
+### Clone the Repository and Build
 
 ```bash
-ros2 launch gazebo_sim slam_real.launch.py
-# ... drive the robot slowly around the whole area (remote or teleop) ...
-```
-Open RViz (Fixed Frame = `map`, add **Map** + **LaserScan**) to watch it build, then save:
-```bash
-mkdir -p ~/go2_maps
-ros2 run nav2_map_server map_saver_cli -f ~/go2_maps/my_area --ros-args -p use_sim_time:=false
+mkdir -p ~/go_sim/src
+cd ~/go_sim/src
+git clone https://github.com/abutalipovvv/go_sim_py.git .
+cd ..
+colcon build --symlink-install
 ```
 
-## 2. Navigate
+### Install Dependencies
 
 ```bash
-ros2 launch gazebo_sim nav2_real.launch.py map:=~/go2_maps/my_area.yaml
+cd ~/go_sim
+rosdep update
+rosdep install --from-paths src --ignore-src -r -y
 ```
-This starts Nav2 (no namespace, `use_sim_time:=false`) **and** the
-`cmd_vel → /api/sport/request` bridge. Then in RViz: **2D Pose Estimate** → **Nav2 Goal**.
 
-Useful overrides:
+## Environment Configuration
+
+### Export Gazebo Models Path
+
+Before running the simulation, export the path to your Gazebo models:
+
 ```bash
-ros2 launch gazebo_sim nav2_real.launch.py \
-    map:=~/go2_maps/my_area.yaml \
-    odom_topic:=/utlidar/robot_odom \
-    scan_topic:=/scan
+export GZ_SIM_RESOURCE_PATH=~/go_sim/src/gazebo_sim/models
 ```
+(Replace with the correct path to your models.)
 
-### The velocity bridge (run standalone if needed)
+### Configure CycloneDDS
+
+To support multiple topics, configure CycloneDDS by creating a configuration file (e.g., cyclonedds.xml) with the following content:
+
 ```bash
-ros2 launch quadropted_controller cmd_vel_bridge.launch.py sim:=false
+<CycloneDDS>
+  <Domain>
+    <General>
+      <Interfaces>
+        <NetworkInterface name="lo" multicast="true" />
+      </Interfaces>
+      <DontRoute>true</DontRoute>
+    </General>
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>100</MaxAutoParticipantIndex>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
 ```
-`cmd_vel_to_sport.py` converts Nav2's `cmd_vel` (Twist) into Unitree sport `Move`
-requests on `/api/sport/request`.
+Then, set the environment variable to point to this file:
 
----
+```bash
+export CYCLONEDDS_URI=file://path_to_cyclonedds.xml
+```
 
-## Things that may need fixing
+(Replace `path_to_cyclonedds.xml` with the actual file path.)
 
-### The bridge (`cmd_vel_to_sport.py`) — UNVALIDATED stub
-- The sport-API `api_id`s (`Move`=1008, `StopMove`=1003) and `unitree_api/msg/Request`
-  field names are from standard `unitree_ros2` but **never run on hardware**. Verify
-  them against YOUR SDK version (`ros2 interface show unitree_api/msg/Request`).
-- **Test with the robot on a stand first** — publish a tiny `cmd_vel` and confirm the
-  legs respond as expected before letting it free-run on the floor.
-- The Go2 must be in `BalanceStand` (sport mode active) or it ignores Move commands.
-- Decide control level: high-level sport `Move` (what this does, recommended) vs
-  low-level `/lowcmd` (full joint control, much harder).
+## Running the Simulation
 
-### Topics / frames
-- Confirm the robot's topics: `ros2 topic list`, and frames: `ros2 run tf2_tools view_frames`.
-- If odom is `/utlidar/robot_odom`, pass `odom_topic:=/utlidar/robot_odom`.
-- `nav2_params_real.yaml` assumes frames `base_link` / `odom` / `map`; adjust if the
-  robot uses different names, or AMCL and the costmaps will fail.
+```bash
+#Navigate to the project directory:
 
-### Map / localization
-- The default map in `nav2_real.launch.py` is the **sim cafe map** — replace it with a
-  real SLAM map of your space (Step 1).
-- In RViz the **Map** display needs **Durability = Transient Local** to show (it's latched).
-- `Waiting for map` / `frame "map" does not exist` → the lifecycle manager must bring up
-  `map_server` before `amcl` (already ordered in `localization_launch.py`).
+cd ~/go_sim
 
-### Build
-- After any `apt upgrade` of `ros2-control`, rebuild the Gazebo control plugin so its ABI
-  matches: `colcon build --packages-select gz_ros2_control --cmake-clean-cache`.
-- `undefined symbol ... diagnostic_updater::Updater ...` → `sudo apt update && sudo apt upgrade`
-  to sync `ros2-control` / `diagnostic-updater` / `tl-expected`, then rebuild.
+#Source the environment setup:
+
+source install/local_setup.bash
+
+#Launch the simulation:
+
+ros2 launch gazebo_sim launch.py
+```
+
+## Controlling the Robot
+
+### Moving the Robot
+
+The robot moves by publishing velocity commands to the `<robot_namespace>/cmd_vel` topic. By default, the robot is named robot1.
+
+Example using `teleop_twist_keyboard`:
+
+```bash
+source install/local_setup.bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r /cmd_vel:=/robot1/cmd_vel
+```
+
+
+![](./media/robot_move.gif)
+
+Robot Modes
+
+The robot supports several modes:
+
+    REST – Default position in which the robot cannot move.
+    STAND – Mode in which the robot can rotate in place.
+    TROT – Walking mode.
+
+The robot operates with 12 degrees of freedom. To enable rotation, switch the mode to "STAND" by publishing to the robot_mode topic.
+
+Example (for a robot with namespace `robot1`):
+
+```bash
+ros2 topic pub /robot1/robot_mode quadropted_msgs/msg/RobotModeCommand "{mode: 'STAND', robot_id: 1}"
+```
+
+After switching modes, control the robot using velocity commands:
+
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r /cmd_vel:=/robot1/cmd_vel
+```
+
+
+![](./media/move1.gif)
+
+### Changing Robot Behavior
+
+The robot can sit and stand using the `robot_behavior_command` service.
+
+Example command:
+
+```bash
+ros2 service call /robot1/robot_behavior_command quadropted_msgs/srv/RobotBehaviorCommand "{command: 'walk'}"
+```
+
+Possible commands:
+
+    walk – The robot stands up (REST) and can walk (TROT).
+    up – The robot stands up (REST) and locks movement.
+    sit – The robot sits down (STAND).
+
+![](./media/sitUp.gif)
+
+## Multi-Robot Setup and Model Switching
+
+### Changing Robot Models
+
+You can change between robot models (e.g., go2, go1) in gazebo_multi_nav2_world.launch.py file 102 str:
+
+![](./media/switch.png)
+
+for go2: use "go2_description" 
+for go1: use "go1_description"
+
+Running Multiple Robots Simultaneously
+![](./media/go1multi.png)
+![](./media/go2multi.png)
+### The repository supports simultaneous operation of multiple robots. Each robot has access to nav2. In the robot.config file, add the robot’s namespace and spawn coordinates in the world.
+![](./media/robot_config.png)
+
+### NAV2 work demonstration: 
+![](./media/robot-nav2.gif)
+
+
+## Credits, thaks for all
+
+    mike4192: (SpotMicro)[https://github.com/mike4192/spotMicro]
+    Unitree Robotics: (A1 ROS)[https://github.com/unitreerobotics/a1_ros]
+    QUADRUPED ROBOTICS: (Quadruped)[https://quadruped.de]
+    lnotspotl: (GitHub)[https://github.com/lnotspotl]
+    anujjain-dev: (Unitree-go2 ROS2)[https://github.com/anujjain-dev/unitree-go2-ros2]
+
+## TODO
+
+    Add Gazebo Classic support (physics and inertial parameters for URDF).
+    Perform odometry calibration 
