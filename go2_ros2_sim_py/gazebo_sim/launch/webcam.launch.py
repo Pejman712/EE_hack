@@ -28,7 +28,10 @@ from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 # v4l2_camera wants integers here; keep it a plain Python list (not a launch arg).
-IMAGE_SIZE = [1280, 720]
+# 640x480 YUYV runs far faster than 720p (the C920's 720p YUYV caps ~10 fps and the
+# RGB conversion is CPU-heavy). MediaPipe pose works fine at this resolution.
+# (MJPG would give 30 fps but this v4l2_camera build can't output MJPG.)
+IMAGE_SIZE = [640, 480]
 
 
 def generate_launch_description():

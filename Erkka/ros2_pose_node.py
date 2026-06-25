@@ -43,7 +43,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from geometry_msgs.msg import PoseArray, Pose, Point, Quaternion
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import Header, ColorRGBA
@@ -210,6 +210,11 @@ class PoseNode(Node):
 
         self.declare_parameter("image_topic", "/image_raw")
         topic = self.get_parameter("image_topic").get_parameter_value().string_value
+        # Subscribe to the COMPRESSED transport instead of raw (much higher effective
+        # FPS over a network, e.g. the real Go2). image_topic stays the BASE topic;
+        # '/compressed' is appended automatically.
+        self.declare_parameter("use_compressed", False)
+        use_compressed = self.get_parameter("use_compressed").get_parameter_value().bool_value
 
         if not os.path.exists(MODEL_PATH):
             self.get_logger().fatal(f"Model not found: {MODEL_PATH}")
@@ -237,7 +242,12 @@ class PoseNode(Node):
         )
         self._landmarker = vision.PoseLandmarker.create_from_options(opts)
 
-        self._sub = self.create_subscription(Image, topic, self._image_cb, sensor_qos)
+        if use_compressed:
+            comp_topic = topic if topic.endswith("/compressed") else topic + "/compressed"
+            self._sub = self.create_subscription(
+                CompressedImage, comp_topic, self._image_cb_compressed, sensor_qos)
+        else:
+            self._sub = self.create_subscription(Image, topic, self._image_cb, sensor_qos)
         self._pub_points = self.create_publisher(PoseArray, "/pointed_location", 10)
         self._pub_skel = self.create_publisher(MarkerArray, "/pose_skeleton", 10)
         self._pub_image = self.create_publisher(Image, "/annotated_image", sensor_qos)
@@ -262,10 +272,20 @@ class PoseNode(Node):
         except Exception as e:
             self.get_logger().error(f"cv_bridge: {e}")
             return
+        self._process(bgr, msg.header)
 
+    def _image_cb_compressed(self, msg: CompressedImage):
+        try:
+            bgr = self._bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as e:
+            self.get_logger().error(f"cv_bridge (compressed): {e}")
+            return
+        self._process(bgr, msg.header)
+
+    def _process(self, bgr, in_header):
         # MediaPipe VIDEO mode needs a strictly monotonic millisecond timestamp.
         # Use the message stamp; fall back to incrementing if stamps aren't set.
-        stamp_ms = int(msg.header.stamp.sec * 1000 + msg.header.stamp.nanosec / 1e6)
+        stamp_ms = int(in_header.stamp.sec * 1000 + in_header.stamp.nanosec / 1e6)
         if self._last_stamp_ms is None or stamp_ms > self._last_stamp_ms:
             self._frame_ms = stamp_ms
         else:
@@ -279,7 +299,7 @@ class PoseNode(Node):
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self._landmarker.detect_for_video(mp_image, self._frame_ms)
 
-        header = Header(stamp=msg.header.stamp, frame_id=msg.header.frame_id)
+        header = Header(stamp=in_header.stamp, frame_id=in_header.frame_id)
 
         n_poses = len(result.pose_landmarks) if result.pose_landmarks else 0
 

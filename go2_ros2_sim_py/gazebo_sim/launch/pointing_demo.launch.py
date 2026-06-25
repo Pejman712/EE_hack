@@ -64,8 +64,12 @@ def generate_launch_description():
                               description='which arm to follow: right|left|either'),
         DeclareLaunchArgument('viz', default_value='true',
                               description='Open a live view of the skeleton overlay'),
+        DeclareLaunchArgument('use_compressed', default_value='false',
+                              description='Pose node reads the COMPRESSED camera stream '
+                                          '(higher FPS over a network / real robot)'),
     ]
     viz = LaunchConfiguration('viz')
+    use_compressed = LaunchConfiguration('use_compressed')
 
     # 1. webcam -> /<ns>/color/image_raw  (reuses webcam.launch.py)
     webcam = IncludeLaunchDescription(
@@ -75,7 +79,9 @@ def generate_launch_description():
 
     # 2. Erkka MediaPipe pose node -> /pointed_location
     pose = ExecuteProcess(
-        cmd=['python3', pose_node, '--ros-args', '-p', ['image_topic:=', image_topic]],
+        cmd=['python3', pose_node, '--ros-args',
+             '-p', ['image_topic:=', image_topic],
+             '-p', ['use_compressed:=', use_compressed]],
         output='screen',
     )
 
