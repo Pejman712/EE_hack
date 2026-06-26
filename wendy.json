@@ -1,13 +1,50 @@
 {
-  "appId": "foxglove",
+  "$schema": "https://wendy.sh/schemas/wendy.json",
+  "appId": "go2-foxglove",
   "version": "0.1.0",
   "platform": "linux",
   "services": {
+    "bridge": {
+      "context": "./bridge",
+      "entitlements": [
+        { "type": "network", "mode": "host" }
+      ]
+    },
+    "camera": {
+      "context": "./camera",
+      "entitlements": [
+        { "type": "network", "mode": "host" }
+      ]
+    },
+    "ros2": {
+      "context": "./ros2",
+      "frameworks": {
+        "ros2": { "domainId": 0, "rmw": "rmw_cyclonedds_cpp", "distro": "humble" }
+      },
+      "entitlements": [
+        { "type": "network", "mode": "host" }
+      ]
+    },
     "recorder": {
       "context": "./recorder",
       "entitlements": [
         { "type": "network", "mode": "host" },
         { "type": "persist", "name": "rosbags", "path": "/data" }
+      ]
+    },
+    "sit_stand": {
+      "context": "./sit_stand",
+      "frameworks": {
+        "ros2": { "domainId": 0, "rmw": "rmw_cyclonedds_cpp", "distro": "humble" }
+      },
+      "entitlements": [
+        { "type": "network", "mode": "host" }
+      ]
+    },
+    "slam": {
+      "context": "./slam",
+      "entitlements": [
+        { "type": "network", "mode": "host" }
       ]
     },
     "nav2": {
