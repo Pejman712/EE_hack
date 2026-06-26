@@ -5,16 +5,24 @@ NO nav2, NO map, NO AMCL, NO odometry. Just the three things between the L1
 LiDAR and the dog's legs:
 
   + static TF        base_link -> <lidar frame>   (so /scan has a frame)
-  + pointcloud_to_laserscan   /utlidar/cloud_deskewed -> /scan (2D slice)
+  + pointcloud_to_laserscan   /utlidar/cloud -> /scan (2D slice, ground removed)
   + cmd_vel_to_sport          /cmd_vel -> /api/sport/request   (drive the dog)
 
 The wander node itself is NOT started here — server.py spawns/kills it on the
 UI's Start/Stop. This launch only stands up the sensing + actuation pipeline so
 that wander has a /scan to read and a bridge to push /cmd_vel through.
 
+We use the RAW /utlidar/cloud (not /utlidar/cloud_deskewed). The L1 is mounted
+looking DOWN-forward, so most returns are the floor; the raw cloud is in the
+tilted sensor frame, so the static base_link->lidar TF's PITCH must match the L1
+mount or the floor lands inside the height band. Ground removal then happens in
+pointcloud_to_laserscan.yaml via the min_height cut (raise it until the floor
+disappears from /scan). See that file's header.
+
 Args mirror the lidar mounting used elsewhere (override name:=value):
-  lidar_topic /utlidar/cloud_deskewed · lidar_frame utlidar_lidar
-  lidar_x 0.28 · lidar_y 0.0 · lidar_z -0.05 · lidar_roll/pitch/yaw 0.0
+  lidar_topic /utlidar/cloud · lidar_frame utlidar_lidar
+  lidar_x 0.28 · lidar_y 0.0 · lidar_z -0.05 · lidar_roll 0.0 · lidar_yaw 0.0
+  lidar_pitch 0.0  -> SET THIS to the L1's downward tilt if the floor shows up.
 """
 import os
 
@@ -39,7 +47,7 @@ def generate_launch_description():
     p2l_params = os.path.join(HERE, "pointcloud_to_laserscan.yaml")
 
     args = [
-        DeclareLaunchArgument("lidar_topic", default_value="/utlidar/cloud_deskewed"),
+        DeclareLaunchArgument("lidar_topic", default_value="/utlidar/cloud"),
         DeclareLaunchArgument("lidar_frame", default_value="utlidar_lidar"),
         DeclareLaunchArgument("lidar_x", default_value="0.28"),
         DeclareLaunchArgument("lidar_y", default_value="0.0"),

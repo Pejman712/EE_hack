@@ -1,22 +1,26 @@
-# pointcloud_to_laserscan — flatten the Unitree L1's 3D cloud into a 2D LaserScan
-# for slam_toolbox. Params apply to the node named `pointcloud_to_laserscan` in
-# slam.launch.py (cloud_in -> /utlidar/cloud_deskewed, scan -> /scan).
+# pointcloud_to_laserscan — flatten the Unitree L1's RAW 3D cloud (/utlidar/cloud)
+# into a 2D LaserScan for the reactive wander. Params apply to the node named
+# `pointcloud_to_laserscan` in pipeline.launch.py (cloud_in -> /utlidar/cloud,
+# scan -> /scan).
 #
-# THE HEIGHT BAND IS THE THING TO TUNE. The L1 is bottom/front mounted and looks
-# down, so a band that's too low maps the FLOOR (walls everywhere, useless) and
-# too high sees nothing. target_frame=base_link means min/max_height are metres
-# ABOVE base_link, i.e. roughly above the robot's body origin. Start here, then
-# watch /scan in Foxglove against the live cloud and adjust:
-#   - floor showing up as obstacles -> raise min_height
-#   - walls missing                 -> widen the band / lower min_height
-# This assumes the deskewed cloud is gravity-aligned; if it isn't, fix the
-# static base_link->lidar rotation in the launch first (a tilted slice is wrong).
+# GROUND REMOVAL = THE HEIGHT BAND. The L1 looks down-forward, so most returns are
+# the FLOOR. We drop them by transforming the cloud into base_link and keeping only
+# points whose height (base_link Z) is in [min_height, max_height]: min_height is
+# the FLOOR CUT, max_height drops the ceiling. Anything outside the band is ignored,
+# so the floor never becomes a fake obstacle.
+#
+# Tuning (watch /scan against the live cloud in Foxglove):
+#   - floor still showing up as obstacles -> RAISE min_height (0.15 -> 0.25 -> ...)
+#   - real low obstacles getting cut      -> lower min_height a touch
+#   - band looks tilted / one side floors  -> the slice axis is wrong: set the L1's
+#       downward mount tilt via lidar_pitch in pipeline.launch.py so base_link Z is
+#       truly vertical (the raw cloud is NOT gravity-aligned, unlike cloud_deskewed).
 pointcloud_to_laserscan:
   ros__parameters:
-    target_frame: base_link        # express the scan in base_link, slice in its Z
-    transform_tolerance: 0.05
-    min_height: 0.10               # metres above base_link — TUNE for the L1
-    max_height: 1.20
+    target_frame: base_link        # transform into base_link, slice/filter in its Z
+    transform_tolerance: 0.10       # raw cloud is robot-clock stamped — a bit of slack
+    min_height: 0.15               # FLOOR CUT (m above base_link) — raise to kill ground
+    max_height: 1.50               # drop ceiling / high returns
     angle_min: -3.14159            # full circle; the L1's real FOV is narrower,
     angle_max: 3.14159             # empty sectors just read as max range
     angle_increment: 0.0087        # ~0.5 deg
