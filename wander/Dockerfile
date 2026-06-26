@@ -46,6 +46,7 @@ COPY entrypoint.sh /entrypoint.sh
 COPY server.py /server.py
 COPY wander.py /wander.py
 COPY ogaboga.py /ogaboga.py
+COPY roam_oa.py /roam_oa.py
 COPY ground_nav.py /ground_nav.py
 COPY scan_debug.py /scan_debug.py
 COPY cmd_vel_to_sport.py /cmd_vel_to_sport.py

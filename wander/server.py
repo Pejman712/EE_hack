@@ -37,6 +37,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCH_FILE = os.path.join(HERE, "pipeline.launch.py")
 WANDER_FILE = os.path.join(HERE, "wander.py")
 OGABOGA_FILE = os.path.join(HERE, "ogaboga.py")
+ROAM_FILE = os.path.join(HERE, "roam_oa.py")
+# /scan-based reactive algos. "roam" is handled separately (SDK obstacle avoidance,
+# no /scan needed) — see api_wander_start.
 ALGOS = {"wander": WANDER_FILE, "ogaboga": OGABOGA_FILE}
 
 SPORT_TOPIC = "/api/sport/request"
@@ -171,10 +174,19 @@ def api_status() -> dict:
 
 @app.post("/api/wander/start")
 def api_wander_start(mode: str = "wander") -> dict:
-    if mode not in ALGOS:
-        raise HTTPException(400, f"unknown mode '{mode}' (wander | ogaboga)")
     if _alive("wander"):
         return {"ok": True, "already": True, "mode": _state["mode"]}
+
+    # roam = the dog's OWN obstacle-avoidance mode (roam_oa.py). It drives the dog
+    # directly over the SDK and needs neither /scan nor the /cmd_vel bridge.
+    if mode == "roam":
+        _state["wander"] = subprocess.Popen(
+            ["python3", ROAM_FILE], start_new_session=True)
+        _state["mode"] = "roam"
+        return {"ok": True, "mode": "roam"}
+
+    if mode not in ALGOS:
+        raise HTTPException(400, f"unknown mode '{mode}' (wander | ogaboga | roam)")
     if not _fresh(_state["scan"]):
         raise HTTPException(503, "no /scan yet — laser pipeline not ready")
     cmd = ["python3", ALGOS[mode]]
@@ -268,13 +280,14 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   code{font-family:ui-monospace,Menlo,monospace;color:#cfe9e3;}
 </style></head><body><div class="wrap">
   <h1>🧭 Go2 Wander</h1>
-  <p class="sub">Reactive "drive toward open space" off the L1 <code>/scan</code> —
-    no map, no planner. The dog keeps moving (and rotates to escape dead-ends)
-    until you press <b>Stop</b>.</p>
+  <p class="sub">Reactive "drive toward open space" off the L2 <code>/scan</code> —
+    no map, no planner. Or pick <b>Roam</b> to let the dog's own SDK
+    obstacle-avoidance walk it around. It keeps moving until you press <b>Stop</b>.</p>
   <div class="card">
     <div class="seg">
       <button id="mWander" class="on" onclick="setAlgo('wander')">Wander (gap-follow)</button>
       <button id="mOga" onclick="setAlgo('ogaboga')">OgaBoga (go/turn)</button>
+      <button id="mRoam" onclick="setAlgo('roam')">Roam (SDK avoid)</button>
     </div>
     <div class="row">
       <button class="go" id="goBtn" onclick="start()">Start wander</button>
@@ -327,10 +340,12 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     const d=document.getElementById("d"+id), v=document.getElementById("v"+id);
     d.className="dot"+(on?" on":(ok?" ok":" bad"));v.textContent=txt;}
   let algo="wander";
+  const ALGO_LABEL={wander:"wander",ogaboga:"ogaboga",roam:"roam"};
   function setAlgo(a){algo=a;
     document.getElementById("mWander").className=a==="wander"?"on":"";
     document.getElementById("mOga").className=a==="ogaboga"?"on":"";
-    document.getElementById("goBtn").textContent="Start "+(a==="ogaboga"?"ogaboga":"wander");}
+    document.getElementById("mRoam").className=a==="roam"?"on":"";
+    document.getElementById("goBtn").textContent="Start "+(ALGO_LABEL[a]||"wander");}
   async function start(){const d=await j("/api/wander/start?mode="+algo,"POST");
     if(d&&d.detail)document.getElementById("status").textContent="error: "+d.detail;
     setTimeout(refresh,300);}
@@ -343,6 +358,7 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     set("Wan",false,s.wandering?(s.mode+" running"):"stopped",s.wandering);
     document.getElementById("mWander").disabled=s.wandering;
     document.getElementById("mOga").disabled=s.wandering;
+    document.getElementById("mRoam").disabled=s.wandering;
     if(s.wandering&&s.mode&&s.mode!==algo)setAlgo(s.mode);  // reflect what's actually running
     const sc=s.sectors;
     document.getElementById("sLeft").textContent =sc?sc.left.toFixed(2)+" m":"—";
@@ -350,12 +366,15 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     document.getElementById("sRight").textContent=sc?sc.right.toFixed(2)+" m":"—";
     if(s.params){PKEYS.forEach(k=>{const el=document.getElementById("p_"+k);
       if(el&&document.activeElement!==el&&s.params[k]!==undefined)el.value=s.params[k];});}
-    document.getElementById("goBtn").disabled=s.wandering||!s.scan_ok;
+    // roam drives the dog over the SDK directly — it doesn't need /scan.
+    document.getElementById("goBtn").disabled=s.wandering||(algo!=="roam"&&!s.scan_ok);
+    const RUNTXT={ogaboga:"ogaboga → forward when clear, turn right when blocked (Stop to halt)",
+      wander:"wander → driving toward open space (Stop to halt)",
+      roam:"roam → dog's own obstacle-avoidance walking it around (Stop to halt)"};
     document.getElementById("status").textContent=
-      s.wandering?(s.mode==="ogaboga"
-          ?"ogaboga → forward when clear, turn right when blocked (Stop to halt)"
-          :"wander → driving toward open space (Stop to halt)")
-      :(s.scan_ok?"ready — press Start":"waiting for /scan…");
+      s.wandering?(RUNTXT[s.mode]||RUNTXT.wander)
+      :(algo==="roam"?"ready — press Start (roam needs no /scan)"
+        :(s.scan_ok?"ready — press Start":"waiting for /scan…"));
   }
   PKEYS.forEach(k=>document.getElementById("p_"+k)
     .addEventListener("change",applyParams));  // auto-apply on edit (Enter/blur)
