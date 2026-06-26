@@ -24,24 +24,39 @@ gets rejected with code 3202 ("mode not enabled"). So we walk a small handshake
 which also means an unsupported firmware leaves the dog standing still instead of
 walking BLIND. On exit we Move(0), drop API control, and disable the mode.
 
+ESCAPE-TURN / MORE ROAMING. The firmware only avoids obstacles AHEAD, so against
+a wall (or a dead-end) it just stops. We watch the dog's measured body speed on
+/sportmodestate: if we're commanding forward but it's stalled (speed < stall_speed
+for stall_time), we count it as BLOCKED and rotate IN PLACE for a randomized
+duration/direction (turn_wz, turn_min_s..turn_max_s) to hunt for a new heading,
+then resume forward. Random direction + duration = it explores instead of pacing
+the same spot. If /sportmodestate isn't arriving, blocked-detection is simply off
+and the firmware's own avoidance still runs.
+
 api_ids / parameter formats match unitree_sdk2py's ObstaclesAvoidClient.
 
 Params (ros2 -p name:=value):
-  vx 0.25        forward speed (m/s)
-  vy 0.0         lateral speed (m/s)
-  vyaw 0.0       constant yaw bias (rad/s) — small value => sweeps/curves while roaming
-  move_hz 10     how often Move is re-sent (the mode has a velocity watchdog)
-  handshake_period 1.0   re-send the current enable step this often until it ACKs
+  vx 0.25 · vy 0.0 · vyaw 0.0        forward / lateral / yaw-bias velocity
+  move_hz 10                         Move re-send rate (the mode has a watchdog)
+  handshake_period 1.0               re-send each enable step until it ACKs
+  turn_wz 0.9                        in-place rotation speed when blocked (rad/s)
+  turn_min_s 1.0 · turn_max_s 2.5    randomized escape-turn duration range (s)
+  stall_speed 0.06 · stall_time 1.0  blocked = slower than this for this long
 """
 import json
 import itertools
+import math
+import random
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from unitree_api.msg import Request, Response
+from unitree_go.msg import SportModeState
 
 OA_REQUEST_TOPIC = "/api/obstacles_avoid/request"
 OA_RESPONSE_TOPIC = "/api/obstacles_avoid/response"
+SPORT_STATE_TOPIC = "/sportmodestate"
 OA_API_ID_SWITCH_SET = 1001
 OA_API_ID_MOVE = 1003
 OA_API_ID_USE_REMOTE = 1004
@@ -58,21 +73,40 @@ class RoamOA(Node):
         self.vyaw = float(p("vyaw", 0.0).value)
         self.move_hz = float(p("move_hz", 10.0).value)
         self.handshake_period = float(p("handshake_period", 1.0).value)
+        self.turn_wz = float(p("turn_wz", 0.9).value)
+        self.turn_min_s = float(p("turn_min_s", 1.0).value)
+        self.turn_max_s = float(p("turn_max_s", 2.5).value)
+        self.stall_speed = float(p("stall_speed", 0.06).value)
+        self.stall_time = float(p("stall_time", 1.0).value)
 
         self._ids = itertools.count(1)
         self._pending = {}        # request id -> label, awaiting a response
-        # Handshake state machine: "switch" -> "remote" -> "ready".
+        # Enable handshake: "switch" -> "remote" -> "ready".
         self._stage = "switch"
+        # While "ready", a sub-behaviour: "forward" or (escape) "turning".
+        self._phase = "forward"
+        self._stall_since = None  # epoch the dog first looked stalled (None = moving)
+        self._turn_until = 0.0    # epoch the current escape-turn ends
+        self._turn_dir = 1.0      # +1 = turn left (CCW), -1 = right
+        self._grace_until = 0.0   # don't re-evaluate stall right after a turn
+        self._meas_speed = 0.0    # latest measured body speed (m/s)
+        self._meas_t = 0.0        # when we last got /sportmodestate
+        self._warned_no_state = False
 
         self._pub = self.create_publisher(Request, OA_REQUEST_TOPIC, 10)
         self.create_subscription(Response, OA_RESPONSE_TOPIC, self._on_response, 10)
+        self.create_subscription(SportModeState, SPORT_STATE_TOPIC, self._on_state,
+                                 qos_profile_sensor_data)
         # Drive the enable handshake until both steps ACK, then Move takes over.
         self._hs_timer = self.create_timer(self.handshake_period, self._handshake)
         self.create_timer(1.0 / self.move_hz, self._tick)
         self.get_logger().info(
             f"roam_oa up: SwitchSet -> UseRemoteCommandFromApi on {OA_REQUEST_TOPIC}, "
-            f"then Move(vx={self.vx}, vy={self.vy}, vyaw={self.vyaw}) @ {self.move_hz:g}Hz "
-            "(stands still until both ACK code=0)")
+            f"then Move(vx={self.vx}) @ {self.move_hz:g}Hz; rotate {self.turn_wz}rad/s "
+            f"{self.turn_min_s}-{self.turn_max_s}s when stalled (stands still until ACK)")
+
+    def _now(self):
+        return self.get_clock().now().nanoseconds * 1e-9
 
     def _send(self, api_id, parameter=""):
         req = Request()
@@ -82,6 +116,10 @@ class RoamOA(Node):
             req.parameter = parameter
         self._pending[req.header.identity.id] = LABELS.get(api_id, str(api_id))
         self._pub.publish(req)
+
+    def _move(self, vx, vy, vyaw):
+        self._send(OA_API_ID_MOVE,
+                   json.dumps({"x": vx, "y": vy, "yaw": vyaw, "mode": 0}))
 
     def _handshake(self):
         if self._stage == "ready":
@@ -97,11 +135,59 @@ class RoamOA(Node):
             self._send(OA_API_ID_USE_REMOTE,
                        json.dumps({"is_remote_commands_from_api": True}))
 
+    def _on_state(self, msg: SportModeState):
+        try:
+            vx, vy = float(msg.velocity[0]), float(msg.velocity[1])
+        except Exception:  # noqa: BLE001
+            return
+        self._meas_speed = math.hypot(vx, vy)
+        self._meas_t = self._now()
+
     def _tick(self):
         if self._stage != "ready":
             return  # safety: never drive until SwitchSet + UseRemote both ACK'd
-        self._send(OA_API_ID_MOVE,
-                   json.dumps({"x": self.vx, "y": self.vy, "yaw": self.vyaw, "mode": 0}))
+        now = self._now()
+
+        # Escape turn in progress: rotate in place until it elapses.
+        if self._phase == "turning":
+            if now < self._turn_until:
+                self._move(0.0, 0.0, self._turn_dir * self.turn_wz)
+                return
+            self._phase = "forward"
+            self._stall_since = None
+            self._grace_until = now + 0.7  # let it pick up speed before judging stall
+
+        # Normal roaming: drive forward (firmware steers around what it sees).
+        self._move(self.vx, self.vy, self.vyaw)
+
+        # Blocked detection needs fresh velocity and a settle grace after turning.
+        if now < self._grace_until:
+            return
+        if (now - self._meas_t) > 0.5:
+            if not self._warned_no_state:
+                self.get_logger().warn(
+                    "no /sportmodestate velocity — escape-turn off (firmware still "
+                    "avoids). Check the topic / QoS.")
+                self._warned_no_state = True
+            return
+        self._warned_no_state = False
+
+        if self._meas_speed < self.stall_speed:
+            if self._stall_since is None:
+                self._stall_since = now
+            elif (now - self._stall_since) >= self.stall_time:
+                self._begin_turn(now)
+        else:
+            self._stall_since = None
+
+    def _begin_turn(self, now):
+        self._phase = "turning"
+        self._turn_dir = random.choice((-1.0, 1.0))
+        dur = random.uniform(self.turn_min_s, self.turn_max_s)
+        self._turn_until = now + dur
+        self._stall_since = None
+        side = "left" if self._turn_dir > 0 else "right"
+        self.get_logger().info(f"blocked (stalled) — rotating {side} {dur:.1f}s for a new heading")
 
     def _on_response(self, msg: Response):
         label = self._pending.pop(msg.header.identity.id, None)
@@ -125,8 +211,7 @@ class RoamOA(Node):
     def stop(self):
         """Halt, drop API control, and disable the mode (best-effort)."""
         try:
-            self._send(OA_API_ID_MOVE,
-                       json.dumps({"x": 0.0, "y": 0.0, "yaw": 0.0, "mode": 0}))
+            self._move(0.0, 0.0, 0.0)
             self._send(OA_API_ID_USE_REMOTE,
                        json.dumps({"is_remote_commands_from_api": False}))
             self._send(OA_API_ID_SWITCH_SET, json.dumps({"enable": False}))
