@@ -31,9 +31,15 @@ import math
 
 import rclpy
 from geometry_msgs.msg import Twist
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
+
+# Params the UI can change live (ros2 param set /wander <name> <value>) — each
+# maps straight onto a self.<name> the control loop reads every tick.
+LIVE_PARAMS = ("front_deg", "steer_deg", "stop_dist", "slow_dist",
+               "max_vx", "max_wz", "k_steer")
 
 
 def _clamp(v, lo, hi):
@@ -61,11 +67,23 @@ class Wander(Node):
         self._cmd = self.create_publisher(Twist, cmd_topic, 10)
         self.create_timer(1.0 / self.rate_hz, self._tick)
 
+        # Apply live edits from `ros2 param set /wander ...` immediately: the
+        # control loop reads self.<name> each tick, so updating them takes effect
+        # on the very next cycle (front_deg/steer_deg are re-converted to radians
+        # in _tick, so they're live too). rate_hz is fixed (timer) — not live.
+        self.add_on_set_parameters_callback(self._on_set_params)
+
         self._count = 0
         self.create_timer(3.0, self._heartbeat)
         self.get_logger().info(
             f"wander up: {scan_topic} -> {cmd_topic} | front=±{self.front_deg}° "
             f"steer=±{self.steer_deg}° stop={self.stop_dist}m max_vx={self.max_vx}")
+
+    def _on_set_params(self, params):
+        for pr in params:
+            if pr.name in LIVE_PARAMS:
+                setattr(self, pr.name, float(pr.value))
+        return SetParametersResult(successful=True)
 
     def _on_scan(self, msg: LaserScan):
         self._scan = msg

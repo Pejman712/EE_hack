@@ -77,4 +77,9 @@ def generate_launch_description():
     bridge = ExecuteProcess(
         cmd=["python3", os.path.join(HERE, "cmd_vel_to_sport.py")], output="screen")
 
-    return LaunchDescription(args + [static_tf, p2l, bridge])
+    # Always-on sector debugger: /scan -> /wander/debug "front,left,right" averages
+    # (the UI shows these; handy for tuning the ground filter even before wandering).
+    scan_debug = ExecuteProcess(
+        cmd=["python3", os.path.join(HERE, "scan_debug.py")], output="screen")
+
+    return LaunchDescription(args + [static_tf, p2l, bridge, scan_debug])

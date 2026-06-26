@@ -43,8 +43,27 @@ SPORT_API_ID_STOP = 1003
 
 app = FastAPI(title="go2-wander")
 
+# Live-tunable wander params (defaults match wander.py). The UI edits these; we
+# `ros2 param set /wander ...` while running (immediate) and pass them at start.
+PARAM_KEYS = ("max_vx", "max_wz", "stop_dist", "slow_dist", "front_deg",
+              "steer_deg", "k_steer")
+_DEFAULT_PARAMS = {"max_vx": 0.30, "max_wz": 0.7, "stop_dist": 0.6,
+                   "slow_dist": 1.5, "front_deg": 30.0, "steer_deg": 90.0,
+                   "k_steer": 1.2}
+
 # Long-lived pipeline launch + the wander subprocess + liveness stamps.
-_state = {"launch": None, "wander": None, "scan": None, "cmd": None}
+_state = {"launch": None, "wander": None, "scan": None, "cmd": None,
+          "sectors": None,  # {"front":m,"left":m,"right":m,"t":epoch} from scan_debug
+          "params": dict(_DEFAULT_PARAMS)}
+
+# Optional env seeds for the headline params (documented in the Dockerfile).
+for _env, _k in (("WANDER_MAX_VX", "max_vx"), ("WANDER_MAX_WZ", "max_wz"),
+                 ("WANDER_STOP_DIST", "stop_dist")):
+    if os.environ.get(_env):
+        try:
+            _state["params"][_k] = float(os.environ[_env])
+        except ValueError:
+            pass
 
 
 # --------------------------------------------------------------------------- procs
@@ -108,14 +127,41 @@ def _liveness_poller(topic: str, key: str, field: str):
         time.sleep(2)
 
 
+def _sector_poller():
+    """Tail /wander/debug (std_msgs/String "front,left,right") from scan_debug and
+    keep the latest sector averages for the UI debugger."""
+    while True:
+        try:
+            proc = subprocess.Popen(
+                ["ros2", "topic", "echo", "/wander/debug", "--field", "data"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                start_new_session=True)
+        except Exception:  # noqa: BLE001
+            time.sleep(3)
+            continue
+        for line in proc.stdout:
+            parts = line.strip().strip('"').split(",")
+            if len(parts) == 3:
+                try:
+                    f, l, r = (float(p) for p in parts)
+                except ValueError:
+                    continue
+                _state["sectors"] = {"front": f, "left": l, "right": r, "t": time.time()}
+        proc.wait()
+        time.sleep(2)
+
+
 # ----------------------------------------------------------------------------- API
 @app.get("/api/status")
 def api_status() -> dict:
+    sec = _state["sectors"]
     return {
         "pipeline_up": _alive("launch"),
         "wandering": _alive("wander"),
         "scan_ok": _fresh(_state["scan"]),
         "cmd_ok": _fresh(_state["cmd"]),
+        "sectors": sec if _fresh(sec) else None,
+        "params": _state["params"],
     }
 
 
@@ -125,17 +171,40 @@ def api_wander_start() -> dict:
         return {"ok": True, "already": True}
     if not _fresh(_state["scan"]):
         raise HTTPException(503, "no /scan yet — laser pipeline not ready")
-    env = dict(os.environ)
-    params = []
-    for env_key, pname in (("WANDER_MAX_VX", "max_vx"), ("WANDER_MAX_WZ", "max_wz"),
-                           ("WANDER_STOP_DIST", "stop_dist")):
-        if env.get(env_key):
-            params += ["-p", f"{pname}:={env[env_key]}"]
-    cmd = ["python3", WANDER_FILE]
-    if params:
-        cmd += ["--ros-args", *params]
-    _state["wander"] = subprocess.Popen(cmd, start_new_session=True)
+    # Launch with the UI's current params so a restart keeps your tuning.
+    args = []
+    for k in PARAM_KEYS:
+        args += ["-p", f"{k}:={_state['params'][k]}"]
+    _state["wander"] = subprocess.Popen(
+        ["python3", WANDER_FILE, "--ros-args", *args], start_new_session=True)
     return {"ok": True}
+
+
+@app.post("/api/wander/params")
+def api_wander_params(body: dict) -> dict:
+    """Update wander params from the UI. Applies IMMEDIATELY to a running node via
+    `ros2 param set /wander ...` (the node's control loop reads them each tick);
+    always stored so the next start uses them too. Unknown keys are ignored."""
+    updated = {}
+    for k, v in body.items():
+        if k not in PARAM_KEYS:
+            continue
+        try:
+            updated[k] = float(v)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{k} must be a number")
+    _state["params"].update(updated)
+    applied = False
+    if _alive("wander") and updated:
+        for k, v in updated.items():
+            try:
+                subprocess.run(["ros2", "param", "set", "/wander", k, repr(v)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=6)
+                applied = True
+            except Exception:  # noqa: BLE001
+                pass
+    return {"ok": True, "params": _state["params"], "applied_live": applied}
 
 
 @app.post("/api/wander/stop")
@@ -169,6 +238,19 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   .dot.ok{background:var(--green);} .dot.bad{background:var(--bad);} .dot.on{background:var(--amber);animation:pulse 1s infinite;}
   @keyframes pulse{50%{opacity:.4;}}
   .nm{flex:1;} .val{color:var(--muted);}
+  .sectors{display:flex;gap:10px;margin:16px 0 0;}
+  .sec{flex:1;text-align:center;border:1px solid var(--line);border-radius:11px;padding:11px 6px;background:#0f1217;}
+  .sec.front{border-color:var(--teal);}
+  .sec label{display:block;font-size:11px;color:var(--muted);margin:0 0 4px;letter-spacing:.03em;}
+  .sval{font-size:20px;font-weight:800;font-variant-numeric:tabular-nums;}
+  .seclab{font-size:11px;color:var(--muted);margin:8px 0 0;}
+  .ttl{font-weight:800;font-size:14px;margin:0 0 12px;}
+  .params{display:grid;grid-template-columns:repeat(2,1fr);gap:10px 14px;margin:0 0 14px;}
+  .params .p{display:flex;flex-direction:column;}
+  .params label{font-size:11px;color:var(--muted);margin:0 0 3px;}
+  .params input{background:#0c0e12;border:1px solid var(--line);border-radius:9px;color:var(--ink);
+    font-size:15px;padding:8px 10px;font-weight:700;font-variant-numeric:tabular-nums;width:100%;}
+  .apply{background:var(--green);color:#0c0e12;width:100%;}
   .status{margin-top:16px;font-size:13px;color:var(--muted);}
   code{font-family:ui-monospace,Menlo,monospace;color:#cfe9e3;}
 </style></head><body><div class="wrap">
@@ -187,10 +269,43 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
       <li><span class="dot" id="dCmd"></span><span class="nm">Velocity <code>/cmd_vel</code></span><span class="val" id="vCmd">—</span></li>
       <li><span class="dot" id="dWan"></span><span class="nm">Wander node</span><span class="val" id="vWan">—</span></li>
     </ul>
+    <div class="sectors">
+      <div class="sec"><label>◀ LEFT</label><div class="sval" id="sLeft">—</div></div>
+      <div class="sec front"><label>▲ FRONT</label><div class="sval" id="sFront">—</div></div>
+      <div class="sec"><label>RIGHT ▶</label><div class="sval" id="sRight">—</div></div>
+    </div>
+    <p class="seclab">Mean <code>/scan</code> range per sector (m) — bigger = more open.
+      The dog steers toward the larger side and slows as <b>Front</b> shrinks.</p>
     <div class="status" id="status">—</div>
   </div>
+
+  <div class="card" style="margin-top:18px">
+    <p class="ttl">⚙ Live tuning</p>
+    <div class="params">
+      <div class="p"><label>max_vx (m/s)</label><input id="p_max_vx" type="number" step="0.05"></div>
+      <div class="p"><label>max_wz (rad/s)</label><input id="p_max_wz" type="number" step="0.05"></div>
+      <div class="p"><label>stop_dist (m)</label><input id="p_stop_dist" type="number" step="0.05"></div>
+      <div class="p"><label>slow_dist (m)</label><input id="p_slow_dist" type="number" step="0.1"></div>
+      <div class="p"><label>front_deg (±°)</label><input id="p_front_deg" type="number" step="5"></div>
+      <div class="p"><label>steer_deg (±°)</label><input id="p_steer_deg" type="number" step="5"></div>
+      <div class="p"><label>k_steer (gain)</label><input id="p_k_steer" type="number" step="0.1"></div>
+    </div>
+    <button class="apply" onclick="applyParams()">Apply now</button>
+    <p class="seclab" id="phint">Edits apply <b>immediately</b> while wandering (and are kept for the next start).</p>
+  </div>
 <script>
-  async function j(u,m){const r=await fetch(u,{method:m||"GET"});return r.json().catch(()=>({}));}
+  const PKEYS=["max_vx","max_wz","stop_dist","slow_dist","front_deg","steer_deg","k_steer"];
+  async function j(u,m,b){const o={method:m||"GET"};
+    if(b){o.headers={"Content-Type":"application/json"};o.body=JSON.stringify(b);}
+    const r=await fetch(u,o);return r.json().catch(()=>({}));}
+  async function applyParams(){
+    const body={};PKEYS.forEach(k=>{const v=parseFloat(document.getElementById("p_"+k).value);
+      if(!isNaN(v))body[k]=v;});
+    const d=await j("/api/wander/params","POST",body);
+    const h=document.getElementById("phint");
+    h.textContent=(d&&d.applied_live)?"applied live ✓":"saved — applies on next Start";
+    setTimeout(()=>{h.innerHTML="Edits apply <b>immediately</b> while wandering (and are kept for the next start).";},1800);
+  }
   function set(id,ok,txt,on){
     const d=document.getElementById("d"+id), v=document.getElementById("v"+id);
     d.className="dot"+(on?" on":(ok?" ok":" bad"));v.textContent=txt;}
@@ -204,11 +319,19 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     set("Scan",s.scan_ok,s.scan_ok?"flowing":"no data");
     set("Cmd",s.cmd_ok,s.cmd_ok?"flowing":"idle");
     set("Wan",false,s.wandering?"running":"stopped",s.wandering);
+    const sc=s.sectors;
+    document.getElementById("sLeft").textContent =sc?sc.left.toFixed(2)+" m":"—";
+    document.getElementById("sFront").textContent=sc?sc.front.toFixed(2)+" m":"—";
+    document.getElementById("sRight").textContent=sc?sc.right.toFixed(2)+" m":"—";
+    if(s.params){PKEYS.forEach(k=>{const el=document.getElementById("p_"+k);
+      if(el&&document.activeElement!==el&&s.params[k]!==undefined)el.value=s.params[k];});}
     document.getElementById("goBtn").disabled=s.wandering||!s.scan_ok;
     document.getElementById("status").textContent=
       s.wandering?"wandering → driving toward open space (Stop to halt)"
       :(s.scan_ok?"ready — press Start":"waiting for /scan…");
   }
+  PKEYS.forEach(k=>document.getElementById("p_"+k)
+    .addEventListener("change",applyParams));  // auto-apply on edit (Enter/blur)
   refresh();setInterval(refresh,1000);
 </script></div></body></html>"""
 
@@ -225,6 +348,7 @@ def _bootstrap():
                      daemon=True).start()
     threading.Thread(target=_liveness_poller, args=("/cmd_vel", "cmd", "linear.x"),
                      daemon=True).start()
+    threading.Thread(target=_sector_poller, daemon=True).start()
 
 
 if __name__ == "__main__":

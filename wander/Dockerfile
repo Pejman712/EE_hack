@@ -44,6 +44,7 @@ RUN pip3 install --no-cache-dir \
 COPY entrypoint.sh /entrypoint.sh
 COPY server.py /server.py
 COPY wander.py /wander.py
+COPY scan_debug.py /scan_debug.py
 COPY cmd_vel_to_sport.py /cmd_vel_to_sport.py
 COPY pipeline.launch.py /pipeline.launch.py
 COPY pointcloud_to_laserscan.yaml /pointcloud_to_laserscan.yaml
