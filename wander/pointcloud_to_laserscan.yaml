@@ -9,9 +9,24 @@
 # the FLOOR CUT, max_height drops the ceiling. Anything outside the band is ignored,
 # so the floor never becomes a fake obstacle.
 #
+# SELF-RETURNS — the thing that makes a naive setup fail. Validated on the real bag
+# (Erkka/bag_19700103_020737): the L1 sees the dog's OWN BODY as a dense shell of
+# returns at 0.0–0.5 m across every azimuth, and crucially those points sit at ALL
+# radii in the forward cone, so a range_min cut alone just pins the scan at the
+# cutoff ("obstacle 0.5 m ahead" every frame) and the dog only ever rotates.
+#
+# THE FIX IS THE HEIGHT CUT. Those body points are all BELOW ~0.30 m in base_link.
+# Measured sweep on the bag: min_height <=0.20 -> forward cone 0% open (all body);
+# min_height >=0.30 -> forward cone 100% open. So min_height 0.30 deletes the body
+# (and the floor) and reveals the real open space. The cost: obstacles shorter than
+# ~0.30 m above base_link (~0.55 m off the ground) are not seen — fine for walls /
+# furniture / people, blind to low curbs. NOTE this depends on the (approximate)
+# base_link->lidar mount in pipeline.launch.py; confirm in Foxglove.
+#
 # Tuning (watch /scan against the live cloud in Foxglove):
-#   - floor still showing up as obstacles -> RAISE min_height (0.15 -> 0.25 -> ...)
-#   - real low obstacles getting cut      -> lower min_height a touch
+#   - dog only rotates, never drives (forward pinned at ~range_min) -> the body is
+#       still in the slice: RAISE min_height (0.30 -> 0.35 -> ...)
+#   - real low obstacles getting cut      -> lower min_height a touch (watch the body!)
 #   - band looks tilted / one side floors  -> the slice axis is wrong: set the L1's
 #       downward mount tilt via lidar_pitch in pipeline.launch.py so base_link Z is
 #       truly vertical (the raw cloud is NOT gravity-aligned, unlike cloud_deskewed).
@@ -19,14 +34,17 @@ pointcloud_to_laserscan:
   ros__parameters:
     target_frame: base_link        # transform into base_link, slice/filter in its Z
     transform_tolerance: 0.10       # raw cloud is robot-clock stamped — a bit of slack
-    min_height: 0.15               # FLOOR CUT (m above base_link) — raise to kill ground
+    min_height: 0.30               # BODY+FLOOR CUT (m above base_link) — see header
     max_height: 1.50               # drop ceiling / high returns
     angle_min: -3.14159            # full circle; the L1's real FOV is narrower,
     angle_max: 3.14159             # empty sectors just read as max range
-    angle_increment: 0.0087        # ~0.5 deg
+    # ~1 deg. The raw L1 frame is sparse (~1391 pts): at 0.5 deg only ~25% of front
+    # rays return (empty bins alias into false disparities); at 1 deg ~170 fill.
+    angle_increment: 0.0175        # ~1 deg
     scan_time: 0.10
-    range_min: 0.20
-    range_max: 30.0                # L1 effective range; dense return is much closer
+    range_min: 0.25                # body is removed by min_height, so keep close real
+                                   # obstacles visible (lower than the old self-cut)
+    range_max: 5.0                # cap usable range at 5 m (open sectors read as 5 m)
     use_inf: true
     inf_epsilon: 1.0
     concurrency_level: 1
