@@ -1,61 +1,61 @@
 #!/usr/bin/env bash
-# Generate the WendyOS template-registry payload for `go2-foxglove` from this
-# repo. The repo root is the deployable app (real values); this script produces
-# the *template-source* form (Go text/template `{{.VAR}}` placeholders) that a
-# templates registry serves to `wendy init --template go2-foxglove`.
+# Generate the WendyOS template-registry payload for `go2-foxglove`, matching the
+# layout and conventions of github.com/wendylabsinc/templates.
 #
-# Output layout (matches the registry's <template>/<language>/ convention):
+# This repo root is the *deployable* app (real default values); this script emits
+# the *template-source* form (Go text/template `{{.VAR}}` placeholders) that the
+# registry serves to `wendy init --template go2-foxglove --language python`.
 #
-#   dist/templates/go2-foxglove/
-#     meta.json            # wizard: phases/questions (APP_ID, GO2_IP, ...)
-#     template.json        # variables + defaults for the python language variant
-#     python/              # the app source, with {{.VAR}} placeholders applied
-#       wendy.json bridge/ camera/ ros2/ recorder/ sit_stand/ slam/ nav2/ ...
+# Output (mirrors <registry>/python/go2-foxglove/):
 #
-# Rendering this payload with the default answers reproduces the deployable repo
-# byte-for-byte. Verify with:  scripts/make-template.sh && wendy json validate \
-#   --help >/dev/null  (see README "Deploy" for the full check).
+#   dist/templates/python/go2-foxglove/
+#     template.json        # variables (APP_ID, FOXGLOVE_PORT, GO2_IP, ...)
+#     wendy.json           # appId -> {{.APP_ID}}
+#     README.md  foxglove-layout.json
+#     bridge/ camera/ ros2/ recorder/ sit_stand/ slam/ nav2/   # with placeholders
+#
+# To publish: copy dist/templates/python/go2-foxglove/ into the registry's
+# python/ dir, and add/refresh the registry's top-level meta.json entry from
+# meta-entry.json in this repo.
+#
+# Placeholders follow the registry's convention: substitute the Dockerfile ENV /
+# EXPOSE declarations and cyclonedds.xml, and leave code/entrypoint fallback
+# defaults literal (the ENV value overrides them at runtime). Rendering with the
+# default answers reproduces the deployable repo.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="$ROOT/dist/templates/go2-foxglove"
-SRC="$OUT/python"
+OUT="$ROOT/dist/templates/python/go2-foxglove"
 
-# Files copied verbatim into the payload (the app itself). README and the two
-# manifests are handled separately.
-APP_PATHS=(wendy.json foxglove-layout.json .gitignore README.md \
-           bridge camera ros2 recorder sit_stand slam nav2)
+APP_DIRS=(bridge camera ros2 recorder sit_stand slam nav2)
+APP_FILES=(wendy.json README.md foxglove-layout.json template.json)
 
 rm -rf "$OUT"
-mkdir -p "$SRC"
-cp "$ROOT/meta.json" "$OUT/meta.json"
-cp "$ROOT/template.json" "$OUT/template.json"
+mkdir -p "$OUT"
+for f in "${APP_FILES[@]}"; do cp "$ROOT/$f" "$OUT/$f"; done
+for d in "${APP_DIRS[@]}"; do cp -r "$ROOT/$d" "$OUT/$d"; done
 
-for p in "${APP_PATHS[@]}"; do
-  [ -e "$ROOT/$p" ] || continue
-  cp -r "$ROOT/$p" "$SRC/$p"
+find "$OUT" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+find "$OUT" -name '*.pyc' -delete 2>/dev/null || true
+
+# --- appId ------------------------------------------------------------------
+sed -i 's/"appId": "go2-foxglove"/"appId": "{{.APP_ID}}"/' "$OUT/wendy.json"
+
+# --- GO2_DDS_ADDRESS: the static cyclonedds.xml of the non-auto-binding svcs --
+for x in bridge ros2 sit_stand; do
+  sed -i 's/192\.168\.123\.18/{{.GO2_DDS_ADDRESS}}/g' "$OUT/$x/cyclonedds.xml"
 done
 
-# Drop build cruft that may have been copied.
-find "$SRC" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-find "$SRC" -name '*.pyc' -delete 2>/dev/null || true
+# --- GO2_IP: the Dockerfile ENV of every service that declares it ------------
+for d in camera recorder slam nav2; do
+  sed -i 's/GO2_IP=192\.168\.123\.161/GO2_IP={{.GO2_IP}}/' "$OUT/$d/Dockerfile"
+done
 
-# --- Apply placeholders -----------------------------------------------------
-# IPs are unambiguous literals; substitute them everywhere EXCEPT README.md,
-# which intentionally documents the defaults as prose.
-ip_files() { grep -rlF "$1" "$SRC" --include='*.py' --include='Dockerfile' \
-               --include='*.sh' --include='*.xml' 2>/dev/null || true; }
-
-while IFS= read -r f; do [ -n "$f" ] && sed -i 's/192\.168\.123\.161/{{.GO2_IP}}/g' "$f"; done < <(ip_files 192.168.123.161)
-while IFS= read -r f; do [ -n "$f" ] && sed -i 's/192\.168\.123\.18/{{.GO2_DDS_ADDRESS}}/g' "$f"; done < <(ip_files 192.168.123.18)
-
-# appId is the one wendy.json value every scaffold must set.
-sed -i 's/"appId": "go2-foxglove"/"appId": "{{.APP_ID}}"/' "$SRC/wendy.json"
-
-# FOXGLOVE_PORT: only in the bridge (README keeps the literal default as prose).
-sed -i 's/FOXGLOVE_PORT=8765/FOXGLOVE_PORT={{.FOXGLOVE_PORT}}/; s/^EXPOSE 8765$/EXPOSE {{.FOXGLOVE_PORT}}/' "$SRC/bridge/Dockerfile"
-sed -i 's/get("FOXGLOVE_PORT", "8765")/get("FOXGLOVE_PORT", "{{.FOXGLOVE_PORT}}")/' "$SRC/bridge/app.py"
+# --- service ports (ENV + EXPOSE) -------------------------------------------
+sed -i 's/FOXGLOVE_PORT=8765/FOXGLOVE_PORT={{.FOXGLOVE_PORT}}/; s/^EXPOSE 8765$/EXPOSE {{.FOXGLOVE_PORT}}/' "$OUT/bridge/Dockerfile"
+sed -i 's/PORT=7000/PORT={{.RECORDER_PORT}}/; s/^EXPOSE 7000$/EXPOSE {{.RECORDER_PORT}}/' "$OUT/recorder/Dockerfile"
+sed -i 's/PORT=7100/PORT={{.NAV2_PORT}}/; s/^EXPOSE 7100$/EXPOSE {{.NAV2_PORT}}/' "$OUT/nav2/Dockerfile"
 
 echo "Wrote template payload to: $OUT"
 echo "Placeholders applied:"
-grep -rn '{{\.' "$SRC" | sed "s#$SRC/#  #"
+grep -rn '{{\.' "$OUT" | sed "s#$OUT/#  #"

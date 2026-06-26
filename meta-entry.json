@@ -1,0 +1,5 @@
+{
+    "name": "go2-foxglove",
+    "description": "Stream a Unitree Go2 into Foxglove (LiDAR, pose+TF, body state, UWB + WebRTC camera over one WebSocket) and drive/map/record it over ROS 2: ros2, recorder (rosbag), sit_stand, slam, nav2 walk-to. Ships a ready-made Foxglove layout.",
+    "languages": ["python"]
+}

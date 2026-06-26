@@ -1,37 +1,52 @@
 {
-  "$schema": "https://wendy.sh/schemas/template.schema.json",
-  "name": "go2-foxglove",
-  "description": "Unitree Go2 → Foxglove streaming + ROS 2 drive/map/record stack.",
-  "language": "python",
-  "variables": [
-    {
-      "name": "APP_ID",
-      "description": "WendyOS application id.",
-      "default": "go2viz"
-    },
-    {
-      "name": "GO2_IP",
-      "description": "Go2 controller IP on the robot LAN (camera WebRTC + ROS 2 NIC selection).",
-      "default": "192.168.123.161"
-    },
-    {
-      "name": "GO2_DDS_ADDRESS",
-      "description": "This device's IP on the robot LAN; DDS binds to it by address.",
-      "default": "192.168.123.18"
-    },
-    {
-      "name": "FOXGLOVE_PORT",
-      "description": "Foxglove WebSocket port served by the bridge.",
-      "default": "8765"
-    }
-  ],
-  "exclude": [
-    ".git",
-    ".claude",
-    "dist",
-    "scripts/make-template.sh",
-    "TEMPLATE.md",
-    "**/__pycache__/**",
-    "**/*.pyc"
-  ]
+    "name": "go2-foxglove",
+    "platform": "linux",
+    "description": "Stream a Unitree Go2 into Foxglove (LiDAR point cloud, pose + TF, body state and UWB over one WebSocket, plus the WebRTC front camera) AND drive/map/record it over ROS 2: bridge, camera, ros2 (unitree_ros2), recorder (rosbag), sit_stand, slam (slam_toolbox) and nav2 (mapless walk-to). Ships a ready-made Foxglove layout. A full-stack expansion of the original 2-service go2-foxglove.",
+    "variables": [
+        {
+            "name": "APP_ID",
+            "description": "Application identifier",
+            "type": "string",
+            "required": true,
+            "prompt": "App ID"
+        },
+        {
+            "name": "FOXGLOVE_PORT",
+            "description": "Port for the Foxglove WebSocket — open Foxglove → Open Connection → ws://<device>:<port>",
+            "type": "integer",
+            "default": 8765,
+            "prompt": "Foxglove WebSocket port",
+            "validate": { "min": 1, "max": 65535 }
+        },
+        {
+            "name": "GO2_IP",
+            "description": "Go2 robot IP on the robot LAN — used by the camera for WebRTC and by the ROS 2 services to pick the NIC that reaches the robot",
+            "type": "string",
+            "default": "192.168.123.161",
+            "prompt": "Go2 IP"
+        },
+        {
+            "name": "GO2_DDS_ADDRESS",
+            "description": "THIS device's OWN IP on the robot network — the address DDS binds to so the Go2 can talk back. On the Go2's onboard Jetson it's usually 192.168.123.18; on an external Jetson bridged to the robot LAN it's that machine's 192.168.123.x. Binding by IP (not interface name) avoids the multi-homed eth0/eth1 problem where DDS advertises the wrong subnet.",
+            "type": "string",
+            "default": "192.168.123.18",
+            "prompt": "This device's IP on the Go2 network"
+        },
+        {
+            "name": "RECORDER_PORT",
+            "description": "Port for the recorder web UI — open http://<device>:<port> to list topics and start/stop rosbag recording",
+            "type": "integer",
+            "default": 7000,
+            "prompt": "Recorder web UI port",
+            "validate": { "min": 1, "max": 65535 }
+        },
+        {
+            "name": "NAV2_PORT",
+            "description": "Port for the nav2 walk-to web UI — open http://<device>:<port> to send the Go2 to an (x, y) point",
+            "type": "integer",
+            "default": 7100,
+            "prompt": "nav2 web UI port",
+            "validate": { "min": 1, "max": 65535 }
+        }
+    ]
 }

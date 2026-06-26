@@ -254,9 +254,10 @@ Variables (`wendy init` prompts, or pass `--var`):
 - **FOXGLOVE_PORT** — the WebSocket port (default `8765`).
 
 The repo root is also directly deployable (real defaults, no `wendy init`): clone
-it and `wendy run --device <go2>.local`. Maintainers: the `go2-foxglove` template
-payload (`meta.json`, `template.json`, placeholdered sources) is generated with
-`scripts/make-template.sh` — see [TEMPLATE.md](TEMPLATE.md).
+it and `wendy run --device <go2>.local`. Maintainers: this repo follows the
+[`wendylabsinc/templates`](https://github.com/wendylabsinc/templates) layout
+(`template.json` + placeholdered sources under `python/go2-foxglove/`); generate
+the registry payload with `scripts/make-template.sh` — see [TEMPLATE.md](TEMPLATE.md).
 
 ## View in Foxglove
 
