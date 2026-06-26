@@ -27,10 +27,11 @@ walking BLIND. On exit we Move(0), drop API control, and disable the mode.
 ESCAPE-TURN / MORE ROAMING. The firmware only avoids obstacles AHEAD, so against
 a wall (or a dead-end) it just stops. We watch the dog's measured body speed on
 /sportmodestate: if we're commanding forward but it's stalled (speed < stall_speed
-for stall_time), we count it as BLOCKED and rotate IN PLACE toward a fixed side
-(turn_dir) for a randomized duration (turn_wz, turn_min_s..turn_max_s) to hunt
-for a new heading, then resume forward. If /sportmodestate isn't arriving,
-blocked-detection is simply off and the firmware's own avoidance still runs.
+for stall_time), we count it as BLOCKED and rotate IN PLACE for a randomized
+duration/direction (turn_wz, turn_min_s..turn_max_s) to hunt for a new heading,
+then resume forward. Random direction + duration = it explores instead of pacing
+the same spot. If /sportmodestate isn't arriving, blocked-detection is simply off
+and the firmware's own avoidance still runs.
 
 api_ids / parameter formats match unitree_sdk2py's ObstaclesAvoidClient.
 
@@ -39,8 +40,7 @@ Params (ros2 -p name:=value):
   move_hz 10                         Move re-send rate (the mode has a watchdog)
   handshake_period 1.0               re-send each enable step until it ACKs
   turn_wz 0.9                        in-place rotation speed when blocked (rad/s)
-  turn_min_s 0.3 · turn_max_s 0.6    randomized escape-turn duration range (s)
-  turn_dir -1.0                      fixed turn side: -1 = right, +1 = left
+  turn_min_s 1.0 · turn_max_s 2.5    randomized escape-turn duration range (s)
   stall_speed 0.06 · stall_time 1.0  blocked = slower than this for this long
 """
 import json
@@ -74,9 +74,8 @@ class RoamOA(Node):
         self.move_hz = float(p("move_hz", 10.0).value)
         self.handshake_period = float(p("handshake_period", 1.0).value)
         self.turn_wz = float(p("turn_wz", 0.9).value)
-        self.turn_min_s = float(p("turn_min_s", 0.3).value)
-        self.turn_max_s = float(p("turn_max_s", 0.6).value)
-        self.turn_dir = float(p("turn_dir", -1.0).value)  # -1 = always right, +1 = always left
+        self.turn_min_s = float(p("turn_min_s", 1.0).value)
+        self.turn_max_s = float(p("turn_max_s", 2.5).value)
         self.stall_speed = float(p("stall_speed", 0.06).value)
         self.stall_time = float(p("stall_time", 1.0).value)
 
@@ -183,7 +182,7 @@ class RoamOA(Node):
 
     def _begin_turn(self, now):
         self._phase = "turning"
-        self._turn_dir = self.turn_dir  # fixed side every time
+        self._turn_dir = random.choice((-1.0, 1.0))
         dur = random.uniform(self.turn_min_s, self.turn_max_s)
         self._turn_until = now + dur
         self._stall_since = None
