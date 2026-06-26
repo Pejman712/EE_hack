@@ -19,10 +19,18 @@ mount or the floor lands inside the height band. Ground removal then happens in
 pointcloud_to_laserscan.yaml via the min_height cut (raise it until the floor
 disappears from /scan). See that file's header.
 
+The Go2 L2's /utlidar/cloud comes out ROLLED 180° ABOUT X relative to base_link
+(it's mounted flipped — Y and Z are negated). We undo that in the static TF with
+lidar_roll = pi, so pointcloud_to_laserscan transforms the cloud into a correct,
+gravity-aligned base_link (floor below, obstacles above, +Y to the left). Without
+this the floor lands inside the height band as a fake wall AND left/right steering
+is mirrored. Any remaining downward mount tilt goes on top via lidar_pitch.
+
 Args mirror the lidar mounting used elsewhere (override name:=value):
   lidar_topic /utlidar/cloud · lidar_frame utlidar_lidar
-  lidar_x 0.28 · lidar_y 0.0 · lidar_z -0.05 · lidar_roll 0.0 · lidar_yaw 0.0
-  lidar_pitch 0.0  -> SET THIS to the L1's downward tilt if the floor shows up.
+  lidar_x 0.28 · lidar_y 0.0 · lidar_z -0.05 · lidar_yaw 0.0
+  lidar_roll 3.14159  -> the L2's 180° X flip (leave at pi unless the cloud is upright)
+  lidar_pitch 0.0     -> ADD the L2's downward tilt here if the floor still shows up.
 """
 import os
 
@@ -52,7 +60,7 @@ def generate_launch_description():
         DeclareLaunchArgument("lidar_x", default_value="0.28"),
         DeclareLaunchArgument("lidar_y", default_value="0.0"),
         DeclareLaunchArgument("lidar_z", default_value="-0.05"),
-        DeclareLaunchArgument("lidar_roll", default_value="0.0"),
+        DeclareLaunchArgument("lidar_roll", default_value="3.14159"),  # L2 cloud is 180° X-flipped
         DeclareLaunchArgument("lidar_pitch", default_value="0.0"),
         DeclareLaunchArgument("lidar_yaw", default_value="0.0"),
     ]

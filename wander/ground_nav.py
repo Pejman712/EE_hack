@@ -37,6 +37,8 @@ Params (ros2 -p name:=value):
   front_deg 30 · steer_deg 90 · stop_dist 0.6 · slow_dist 1.5
   max_vx 0.30 · max_wz 0.7 · k_steer 1.2 · range_max 8.0 · rate_hz 12
   publish_obstacles false   set true to emit /wander/obstacles for Foxglove
+  flip_x_180 true   undo the L2 cloud's 180° X mount flip (negate y,z); RANSAC
+                    levels tilt but NOT this mirror, so leave true on the real dog
 """
 import math
 import struct
@@ -59,11 +61,17 @@ def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-def cloud_to_xyz(msg: PointCloud2) -> np.ndarray:
+def cloud_to_xyz(msg: PointCloud2, flip_x_180: bool = True) -> np.ndarray:
     """sensor_msgs/PointCloud2 -> (N,3) float32 xyz, parsed straight from the buffer.
 
     Reads each field by its declared offset; assumes x/y/z are FLOAT32 (datatype 7),
     which is what the Unitree cloud uses. Returns finite points only.
+
+    The Go2 L2's /utlidar/cloud is ROLLED 180° ABOUT X (mounted flipped), so we undo
+    it by negating Y and Z, giving a forward(+x)/left(+y)/up(+z) cloud. RANSAC
+    leveling fixes the floor TILT but NOT this handedness mirror, so without the
+    un-flip the steering comes out left/right reversed. Set flip_x_180=False if the
+    cloud is already upright.
     """
     off = {f.name: f.offset for f in msg.fields if f.name in ("x", "y", "z")}
     if not all(k in off for k in ("x", "y", "z")):
@@ -76,6 +84,8 @@ def cloud_to_xyz(msg: PointCloud2) -> np.ndarray:
         return raw[:, o : o + 4].copy().view(np.float32).ravel()
 
     xyz = np.stack([col(off["x"]), col(off["y"]), col(off["z"])], axis=1)
+    if flip_x_180:
+        xyz[:, 1:] *= -1.0  # 180° about X: y -> -y, z -> -z
     return xyz[np.isfinite(xyz).all(axis=1)]
 
 
@@ -144,6 +154,7 @@ class GroundNav(Node):
         self.range_max = float(p("range_max", 8.0).value)
         self.rate_hz = float(p("rate_hz", 12.0).value)
         self.publish_obstacles = bool(p("publish_obstacles", False).value)
+        self.flip_x_180 = bool(p("flip_x_180", True).value)  # L2 cloud is 180° X-flipped
         cloud_topic = p("cloud_topic", "/utlidar/cloud").value
         cmd_topic = p("cmd_vel_topic", "/cmd_vel").value
 
@@ -187,7 +198,7 @@ class GroundNav(Node):
             self._cmd.publish(Twist())
             return
 
-        pts = cloud_to_xyz(self._cloud)
+        pts = cloud_to_xyz(self._cloud, self.flip_x_180)
         if len(pts) < 50:
             self._cmd.publish(Twist())
             return
