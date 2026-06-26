@@ -1,0 +1,28 @@
+# pointcloud_to_laserscan — flatten the Unitree L1's 3D cloud into a 2D LaserScan
+# for slam_toolbox. Params apply to the node named `pointcloud_to_laserscan` in
+# slam.launch.py (cloud_in -> /utlidar/cloud_deskewed, scan -> /scan).
+#
+# THE HEIGHT BAND IS THE THING TO TUNE. The L1 is bottom/front mounted and looks
+# down, so a band that's too low maps the FLOOR (walls everywhere, useless) and
+# too high sees nothing. target_frame=base_link means min/max_height are metres
+# ABOVE base_link, i.e. roughly above the robot's body origin. Start here, then
+# watch /scan in Foxglove against the live cloud and adjust:
+#   - floor showing up as obstacles -> raise min_height
+#   - walls missing                 -> widen the band / lower min_height
+# This assumes the deskewed cloud is gravity-aligned; if it isn't, fix the
+# static base_link->lidar rotation in the launch first (a tilted slice is wrong).
+pointcloud_to_laserscan:
+  ros__parameters:
+    target_frame: base_link        # express the scan in base_link, slice in its Z
+    transform_tolerance: 0.05
+    min_height: 0.10               # metres above base_link — TUNE for the L1
+    max_height: 1.20
+    angle_min: -3.14159            # full circle; the L1's real FOV is narrower,
+    angle_max: 3.14159             # empty sectors just read as max range
+    angle_increment: 0.0087        # ~0.5 deg
+    scan_time: 0.10
+    range_min: 0.20
+    range_max: 30.0                # L1 effective range; dense return is much closer
+    use_inf: true
+    inf_epsilon: 1.0
+    concurrency_level: 1

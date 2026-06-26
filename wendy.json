@@ -10,8 +10,8 @@
         { "type": "persist", "name": "rosbags", "path": "/data" }
       ]
     },
-    "nav2": {
-      "context": "./nav2",
+    "wander": {
+      "context": "./wander",
       "frameworks": {
         "ros2": {
           "domainId": 0,
