@@ -36,6 +36,8 @@ PORT = int(os.environ.get("PORT", "7100"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCH_FILE = os.path.join(HERE, "pipeline.launch.py")
 WANDER_FILE = os.path.join(HERE, "wander.py")
+OGABOGA_FILE = os.path.join(HERE, "ogaboga.py")
+ALGOS = {"wander": WANDER_FILE, "ogaboga": OGABOGA_FILE}
 
 SPORT_TOPIC = "/api/sport/request"
 SPORT_TYPE = "unitree_api/msg/Request"
@@ -54,7 +56,8 @@ _DEFAULT_PARAMS = {"max_vx": 0.30, "max_wz": 0.7, "stop_dist": 0.6,
 # Long-lived pipeline launch + the wander subprocess + liveness stamps.
 _state = {"launch": None, "wander": None, "scan": None, "cmd": None,
           "sectors": None,  # {"front":m,"left":m,"right":m,"t":epoch} from scan_debug
-          "params": dict(_DEFAULT_PARAMS)}
+          "params": dict(_DEFAULT_PARAMS),
+          "mode": "wander"}  # which algo the running node is ("wander" | "ogaboga")
 
 # Optional env seeds for the headline params (documented in the Dockerfile).
 for _env, _k in (("WANDER_MAX_VX", "max_vx"), ("WANDER_MAX_WZ", "max_wz"),
@@ -162,22 +165,28 @@ def api_status() -> dict:
         "cmd_ok": _fresh(_state["cmd"]),
         "sectors": sec if _fresh(sec) else None,
         "params": _state["params"],
+        "mode": _state["mode"],
     }
 
 
 @app.post("/api/wander/start")
-def api_wander_start() -> dict:
+def api_wander_start(mode: str = "wander") -> dict:
+    if mode not in ALGOS:
+        raise HTTPException(400, f"unknown mode '{mode}' (wander | ogaboga)")
     if _alive("wander"):
-        return {"ok": True, "already": True}
+        return {"ok": True, "already": True, "mode": _state["mode"]}
     if not _fresh(_state["scan"]):
         raise HTTPException(503, "no /scan yet — laser pipeline not ready")
-    # Launch with the UI's current params so a restart keeps your tuning.
-    args = []
-    for k in PARAM_KEYS:
-        args += ["-p", f"{k}:={_state['params'][k]}"]
-    _state["wander"] = subprocess.Popen(
-        ["python3", WANDER_FILE, "--ros-args", *args], start_new_session=True)
-    return {"ok": True}
+    cmd = ["python3", ALGOS[mode]]
+    # wander takes the UI's live-tunable params; ogaboga runs on its own defaults.
+    if mode == "wander":
+        args = []
+        for k in PARAM_KEYS:
+            args += ["-p", f"{k}:={_state['params'][k]}"]
+        cmd += ["--ros-args", *args]
+    _state["wander"] = subprocess.Popen(cmd, start_new_session=True)
+    _state["mode"] = mode
+    return {"ok": True, "mode": mode}
 
 
 @app.post("/api/wander/params")
@@ -251,6 +260,10 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   .params input{background:#0c0e12;border:1px solid var(--line);border-radius:9px;color:var(--ink);
     font-size:15px;padding:8px 10px;font-weight:700;font-variant-numeric:tabular-nums;width:100%;}
   .apply{background:var(--green);color:#0c0e12;width:100%;}
+  .seg{display:flex;border:1px solid var(--line);border-radius:11px;overflow:hidden;margin:0 0 12px;}
+  .seg button{flex:1;background:transparent;color:var(--muted);border:none;padding:10px;font-weight:800;font-size:14px;cursor:pointer;}
+  .seg button.on{background:var(--teal);color:#0c0e12;}
+  .seg button:disabled{opacity:.5;cursor:not-allowed;}
   .status{margin-top:16px;font-size:13px;color:var(--muted);}
   code{font-family:ui-monospace,Menlo,monospace;color:#cfe9e3;}
 </style></head><body><div class="wrap">
@@ -259,6 +272,10 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     no map, no planner. The dog keeps moving (and rotates to escape dead-ends)
     until you press <b>Stop</b>.</p>
   <div class="card">
+    <div class="seg">
+      <button id="mWander" class="on" onclick="setAlgo('wander')">Wander (gap-follow)</button>
+      <button id="mOga" onclick="setAlgo('ogaboga')">OgaBoga (go/turn)</button>
+    </div>
     <div class="row">
       <button class="go" id="goBtn" onclick="start()">Start wander</button>
       <button class="stop" onclick="stop()">■ Stop</button>
@@ -309,7 +326,12 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   function set(id,ok,txt,on){
     const d=document.getElementById("d"+id), v=document.getElementById("v"+id);
     d.className="dot"+(on?" on":(ok?" ok":" bad"));v.textContent=txt;}
-  async function start(){const d=await j("/api/wander/start","POST");
+  let algo="wander";
+  function setAlgo(a){algo=a;
+    document.getElementById("mWander").className=a==="wander"?"on":"";
+    document.getElementById("mOga").className=a==="ogaboga"?"on":"";
+    document.getElementById("goBtn").textContent="Start "+(a==="ogaboga"?"ogaboga":"wander");}
+  async function start(){const d=await j("/api/wander/start?mode="+algo,"POST");
     if(d&&d.detail)document.getElementById("status").textContent="error: "+d.detail;
     setTimeout(refresh,300);}
   async function stop(){await j("/api/wander/stop","POST");setTimeout(refresh,300);}
@@ -318,7 +340,10 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     set("Pipe",s.pipeline_up,s.pipeline_up?"up":"starting…");
     set("Scan",s.scan_ok,s.scan_ok?"flowing":"no data");
     set("Cmd",s.cmd_ok,s.cmd_ok?"flowing":"idle");
-    set("Wan",false,s.wandering?"running":"stopped",s.wandering);
+    set("Wan",false,s.wandering?(s.mode+" running"):"stopped",s.wandering);
+    document.getElementById("mWander").disabled=s.wandering;
+    document.getElementById("mOga").disabled=s.wandering;
+    if(s.wandering&&s.mode&&s.mode!==algo)setAlgo(s.mode);  // reflect what's actually running
     const sc=s.sectors;
     document.getElementById("sLeft").textContent =sc?sc.left.toFixed(2)+" m":"—";
     document.getElementById("sFront").textContent=sc?sc.front.toFixed(2)+" m":"—";
@@ -327,7 +352,9 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
       if(el&&document.activeElement!==el&&s.params[k]!==undefined)el.value=s.params[k];});}
     document.getElementById("goBtn").disabled=s.wandering||!s.scan_ok;
     document.getElementById("status").textContent=
-      s.wandering?"wandering → driving toward open space (Stop to halt)"
+      s.wandering?(s.mode==="ogaboga"
+          ?"ogaboga → forward when clear, turn right when blocked (Stop to halt)"
+          :"wander → driving toward open space (Stop to halt)")
       :(s.scan_ok?"ready — press Start":"waiting for /scan…");
   }
   PKEYS.forEach(k=>document.getElementById("p_"+k)
