@@ -75,6 +75,10 @@ class Wander(Node):
         self.escape_wz = float(p("escape_wz", 0.60).value)  # rotate rate when boxed in
         self.smooth = float(p("smooth", 0.4).value)         # EMA alpha (0=off,->1 snappy)
         self.rate_hz = float(p("rate_hz", 12.0).value)
+        # Set true if the lidar is mounted UPSIDE DOWN: forward stays forward but
+        # left/right are mirrored, so the dog would steer the wrong way (into walls).
+        # This reverses the scan to restore correct left/right.
+        self.flip_scan = bool(p("flip_scan", False).value)
         scan_topic = p("scan_topic", "/scan").value
         cmd_topic = p("cmd_vel_topic", "/cmd_vel").value
 
@@ -122,6 +126,8 @@ class Wander(Node):
                 out.append(cap)
             else:
                 out.append(min(r, cap))
+        if self.flip_scan:
+            out.reverse()   # upside-down lidar: un-mirror left/right
         return out, cap
 
     def _find_disparities(self, r, lo, hi):
@@ -204,8 +210,11 @@ class Wander(Node):
             wz = self._guard_sides(wz, ranges, s)   # don't yaw into a wall while moving
 
         # EMA smoothing: suppress per-frame gap hopping / twitch on the sparse L1.
+        # SAFETY: only smooth speeding UP — a slow-down/stop takes effect instantly,
+        # so EMA lag can never carry the dog forward into an obstacle it just decided
+        # to stop for. (Turning stays smoothed both ways; turn lag isn't dangerous.)
         a = _clamp(self.smooth, 0.0, 1.0)
-        vx = a * vx + (1.0 - a) * self._prev_vx
+        vx = vx if vx < self._prev_vx else a * vx + (1.0 - a) * self._prev_vx
         wz = a * wz + (1.0 - a) * self._prev_wz
         self._prev_vx, self._prev_wz = vx, wz
 
