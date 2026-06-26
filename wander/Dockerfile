@@ -38,12 +38,14 @@ RUN . /opt/ros/humble/setup.sh \
  && rm -rf build log /tmp/unitree_ros2
 
 # FastAPI server deps (no Pillow/PyYAML — there is no map to render or parse).
+# numpy: ground_nav.py does the 3D floor-plane RANSAC + leveling in numpy.
 RUN pip3 install --no-cache-dir \
-        fastapi==0.115.6 uvicorn==0.34.0 pydantic==2.10.4
+        fastapi==0.115.6 uvicorn==0.34.0 pydantic==2.10.4 numpy==1.26.4
 
 COPY entrypoint.sh /entrypoint.sh
 COPY server.py /server.py
 COPY wander.py /wander.py
+COPY ground_nav.py /ground_nav.py
 COPY scan_debug.py /scan_debug.py
 COPY cmd_vel_to_sport.py /cmd_vel_to_sport.py
 COPY pipeline.launch.py /pipeline.launch.py
