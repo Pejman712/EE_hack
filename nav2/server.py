@@ -50,6 +50,7 @@ from pydantic import BaseModel
 PORT = int(os.environ.get("PORT", "7100"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAUNCH_FILE = os.path.join(HERE, "nav2_mapped.launch.py")
+WANDER_FILE = os.path.join(HERE, "wander.py")
 MAP_YAML = os.environ.get("MAP_YAML", os.path.join(HERE, "maps", "map.yaml"))
 ODOM_SOURCE = os.environ.get("ODOM_SOURCE", "utlidar")
 
@@ -80,7 +81,8 @@ _nav = {"launch": None, "goal": None, "x": None, "y": None, "yaw": None,
         "started": None, "result": None, "pose": None,
         "odom": None, "odom_zero": None,
         # liveness stamps for the per-link diagnostics ({"t": <epoch>} or None)
-        "scan": None, "cmdvel": None}
+        "scan": None, "cmdvel": None,
+        "wander": None}  # reactive /scan->/cmd_vel wander subprocess
 _map = {"meta": None, "png": None, "png_mtime": None}
 
 
@@ -136,6 +138,11 @@ def _launch_alive() -> bool:
 
 def _is_navigating() -> bool:
     p = _nav["goal"]
+    return p is not None and p.poll() is None
+
+
+def _wandering() -> bool:
+    p = _nav["wander"]
     return p is not None and p.poll() is None
 
 
@@ -280,6 +287,7 @@ def api_status() -> dict:
         "pose": pose,
         "odom": _tared_odom(),
         "odom_tared": _nav["odom_zero"] is not None,
+        "wandering": _wandering(),
     }
 
 
@@ -289,6 +297,7 @@ def api_diag() -> dict:
     True/False, or None when the check only applies while navigating. The UI walks
     these top-to-bottom and stops at the first broken link (the `blocker`)."""
     navg = _is_navigating()
+    active = navg or _wandering()  # /cmd_vel only flows while one of these drives
     steps = [
         {"name": "Nav2 stack running",
          "ok": _launch_alive(),
@@ -312,13 +321,13 @@ def api_diag() -> dict:
                  "on the walls, and confirm amcl reached 'active'.",
          "cmd": "ros2 lifecycle get /amcl ; ros2 run tf2_ros tf2_echo map base_link"},
         {"name": "Controller output  /cmd_vel",
-         "ok": _fresh(_nav["cmdvel"]) if navg else None,
+         "ok": _fresh(_nav["cmdvel"]) if active else None,
          "hint": "Only meaningful while a goal is active. If navigating but this is red, "
                  "the planner/controller is stuck: no valid path, costmap blocked, or the "
                  "goal sits in an obstacle/unknown cell.",
          "cmd": "ros2 topic echo /cmd_vel"},
         {"name": "Sport bridge  (/cmd_vel → /api/sport/request)",
-         "ok": _fresh(_nav["cmdvel"]) if navg else None,
+         "ok": _fresh(_nav["cmdvel"]) if active else None,
          "hint": "cmd_vel_to_sport relays Twist to the dog. If cmd_vel flows but the dog "
                  "doesn't move: make sure it's in BalanceStand (sport ignores Move while "
                  "sitting) and watch /api/sport/request.",
@@ -375,6 +384,8 @@ def api_goal(req: PoseReq) -> dict:
         raise HTTPException(503, "nav2 stack not running yet — try again in a few seconds")
     if _is_navigating():
         raise HTTPException(409, "already navigating — stop first")
+    if _wandering():
+        raise HTTPException(409, "wander mode is running — stop it first")
     x, y, yaw = float(req.x), float(req.y), float(req.yaw)
     qz, qw = _quat(yaw)
     goal = (
@@ -407,9 +418,50 @@ def api_stop() -> dict:
             os.killpg(os.getpgid(p.pid), signal.SIGINT)
         except Exception:  # noqa: BLE001
             pass
+    _stop_wander()
     _stop_dog()
     _nav["result"] = "stopped"
     return {"ok": True, "cancelled": cancelled}
+
+
+def _stop_wander():
+    """SIGINT the wander node (it zeroes /cmd_vel on exit) and forget it."""
+    p = _nav["wander"]
+    if p is not None and p.poll() is None:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGINT)
+            p.wait(timeout=2.0)
+        except Exception:  # noqa: BLE001
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+    _nav["wander"] = None
+
+
+@app.post("/api/nav/wander_start")
+def api_wander_start() -> dict:
+    """Start reactive wander (drive toward open space off /scan). Refuses while a
+    goal is active — they'd both drive /cmd_vel. Needs /scan flowing + the bridge
+    (both come up with the nav2 stack)."""
+    if _is_navigating():
+        raise HTTPException(409, "a goal is navigating — stop it first")
+    if _wandering():
+        return {"ok": True, "already": True}
+    if not _fresh(_nav["scan"]):
+        raise HTTPException(503, "no /scan yet — wander needs the laser (see diagnostics)")
+    _nav["wander"] = subprocess.Popen(
+        ["python3", WANDER_FILE], start_new_session=True)
+    _nav["result"] = None
+    return {"ok": True}
+
+
+@app.post("/api/nav/wander_stop")
+def api_wander_stop() -> dict:
+    _stop_wander()
+    _stop_dog()
+    _nav["result"] = "stopped"
+    return {"ok": True}
 
 
 PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -526,6 +578,16 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
         </div>
         <p class="hint" id="ohint">Live <code>odom→base_link</code> from <code>/utlidar/robot_odom</code>.</p>
       </div>
+
+      <div class="card">
+        <h3 class="goal">🧭 Wander (reactive)</h3>
+        <div class="row">
+          <button class="send goal" id="wanderBtn" onclick="wanderStart()">Start wander</button>
+          <button class="stop" onclick="wanderStop()">■ Stop</button>
+        </div>
+        <p class="hint" id="whint">Drives toward open space off <code>/scan</code> (no map / planner).
+          Runs until you stop it. Can't run while a goal is navigating.</p>
+      </div>
     </div>
   </div>
 
@@ -622,6 +684,9 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
   async function stop(){await j("/api/nav/stop","POST");setTimeout(refresh,300);}
   async function resetOdom(){await j("/api/nav/odom_reset","POST");refresh();}
   async function unresetOdom(){await j("/api/nav/odom_unreset","POST");refresh();}
+  async function wanderStart(){const d=await j("/api/nav/wander_start","POST");
+    if(d&&d.detail)setStatus("warn","error: "+d.detail);setTimeout(refresh,300);}
+  async function wanderStop(){await j("/api/nav/wander_stop","POST");setTimeout(refresh,300);}
 
   function setStatus(cls,txt){
     document.getElementById("status").innerHTML=
@@ -656,9 +721,13 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
       ?"Tared — showing displacement since reset (display only; TF/AMCL untouched)."
       :"Live <code>odom→base_link</code> from <code>/utlidar/robot_odom</code>.";
     renderDiag(await j("/api/nav/diag"));
+    const wb=document.getElementById("wanderBtn");
+    wb.textContent=s.wandering?"Wandering…":"Start wander";wb.disabled=s.wandering;
+    document.getElementById("goBtn").disabled=s.wandering;
     if(!s.nav2_up){setStatus("warn","nav2 starting up…");return;}
     let m=robot?"":"  (no robot pose yet — set an initial pose)";
-    if(s.navigating)setStatus("on","navigating → ("+s.goal.x.toFixed(2)+", "+s.goal.y.toFixed(2)+") m"+m);
+    if(s.wandering)setStatus("on","wandering → driving toward open space (Stop to halt)");
+    else if(s.navigating)setStatus("on","navigating → ("+s.goal.x.toFixed(2)+", "+s.goal.y.toFixed(2)+") m"+m);
     else setStatus("","idle"+(s.result?" — last: "+s.result:"")+" · nav2 ready"+m);}
 
   async function boot(){

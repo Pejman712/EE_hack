@@ -56,6 +56,7 @@ COPY nav2.launch.py /nav2.launch.py
 COPY nav2_mapped.launch.py /nav2_mapped.launch.py
 COPY cmd_vel_to_sport.py /cmd_vel_to_sport.py
 COPY go2_odom.py /go2_odom.py
+COPY wander.py /wander.py
 COPY config /config
 COPY maps /maps
 RUN chmod +x /entrypoint.sh
