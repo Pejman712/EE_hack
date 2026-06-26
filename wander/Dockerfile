@@ -16,6 +16,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # node. NO navigation2 / nav2-bringup — wander needs none of it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-humble-rmw-cyclonedds-cpp \
+        ros-humble-rosidl-generator-dds-idl \
         ros-humble-tf2-ros \
         ros-humble-pointcloud-to-laserscan \
         python3-pip git iproute2 \
